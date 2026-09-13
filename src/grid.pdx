@@ -229,4 +229,190 @@ module Grid = structure {
       }
     }
 
+  // ===================================================================
+  // Wave OO (R102.M2-001, issue #3) -- grid math + full-window redraw.
+  //
+  // The M3-002 ANSI parser (src/ansi.pdx, already CLOSED) and its
+  // three M4 golden-fingerprint smokes (also CLOSED) consume the
+  // 25-row/4-byte-cell `_grid_cells` surface above via grid_reset /
+  // grid_set_cursor / grid_write_char. Issue #3 specifies a distinct
+  // shape (24 rows, separate glyph/attr byte planes, an explicit
+  // grid_put_char/grid_clear/grid_render_all API), so this landing
+  // adds it as a SEPARATE surface (`_cell_char` / `_cell_attr`,
+  // RENDER_ROWS=24 / RENDER_COLS=80) rather than reshaping
+  // `_grid_cells` underneath the already-landed ANSI/smoke call
+  // sites. Consolidating the two grid representations into one is
+  // left as a follow-up once a build/debugger pass can confirm the
+  // ANSI-parser fingerprints (TestAnsi, CursorMove, RenderIdentity,
+  // ShellEchoRoundtrip) survive the merge.
+  //
+  // grid_render_all blits each cell through `pdxterm_glyph_blit`
+  // (below): paideia-as 0.36 has no STB_WEAK linkage (see
+  // tools/user/cat/src/schema_wire.pdx and
+  // tools/user/libpdx-elevate/src/elevate_audit_sink.pdx for prior
+  // art establishing this project's convention), so the "WEAK stub"
+  // the issue calls for is, per that convention, an ordinary real
+  // function with an inert body: it accepts the real (x, y, char)
+  // shape and returns 0 without touching a framebuffer, since
+  // libpdx-font is not linkable yet. When libpdx-font lands, only
+  // this function's body changes.
+  // ===================================================================
+
+  pub let RENDER_ROWS      : u64 = 24
+  pub let RENDER_COLS      : u64 = 80
+  pub let RENDER_DEFAULT_ATTR : u64 = 0x07   // fg=7 (white) / bg=0 (black), matches DEFAULT_FG/DEFAULT_BG
+
+  // .bss: 24 * 80 = 1920 bytes per plane. Kept as two separate byte
+  // planes (rather than the interleaved 4-byte-cell shape above)
+  // because the issue names them individually (`_cell_char`,
+  // `_cell_attr`) as the M2-001 target surface.
+  pub let mut _cell_char : [u8; 1920] = uninit @align(8)
+  pub let mut _cell_attr : [u8; 1920] = uninit @align(8)
+
+  pub let mut _grid_render_call_count : u64 = uninit @align(8)
+
+  // grid_clear() -- zero both cell planes. 1920 = 240 * 8, so both
+  // planes zero in 240 u64-wide stores each (same shape as
+  // grid_reset's 1000-store loop over `_grid_cells`).
+  pub let grid_clear : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-001 (issue #3) grid_clear. Zero _cell_char then _cell_attr, 240 u64-wide stores each (1920 / 8 = 240 exactly). Leaf; r11 scratch for rip-relative lea; rcx loop counter (caller-save). No `test`; loop gate is `cmp rcx, 240; jb`. All immediates (240, 8) fit imm32. No push/pop parity.",
+      block: {
+        lea r11, [rip + _cell_char];
+        xor rcx, rcx;
+        xor rax, rax;
+      grid_clear_char_loop:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 240;
+        jb grid_clear_char_loop;
+
+        lea r11, [rip + _cell_attr];
+        xor rcx, rcx;
+      grid_clear_attr_loop:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 240;
+        jb grid_clear_attr_loop;
+        ret
+      }
+    }
+
+  // grid_put_char(row, col, ch) -> u64
+  //   Bounds-check (row, col) against RENDER_ROWS/RENDER_COLS; on
+  //   success, store `ch`'s low byte into _cell_char[row*80+col] and
+  //   RENDER_DEFAULT_ATTR into the matching _cell_attr slot. Returns
+  //   0 on in-bounds write, 1 on out-of-bounds (no write).
+  //   Three curried args (row, col, ch) -- within the 4-arg limit, so
+  //   no packing is needed.
+  pub let grid_put_char : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row: u64) (col: u64) (ch: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-001 (issue #3) grid_put_char. Leaf: every register used (rax, rcx, rdx, r10, r11) is caller-save. Bounds gates are `cmp reg, imm; jae fail` (row >= 24, col >= 80). Offset = row*80+col composed via (row<<6)+(row<<4)+col to avoid 2-op imul. Byte stores via `mov_b [ptr+idx], reg`. All immediates fit imm32 (24, 80, 0x07, 6, 4). Labels prefixed gpc_.",
+      block: {
+        cmp rdi, 24;
+        jae gpc_oob;
+        cmp rsi, 80;
+        jae gpc_oob;
+
+        mov rax, rdi;
+        mov rcx, rdi;
+        shl rax, 6;                        // row * 64
+        shl rcx, 4;                        // row * 16
+        add rax, rcx;                      // row * 80
+        add rax, rsi;                      // + col
+
+        lea r10, [rip + _cell_char];
+        mov_b [r10 + rax], rdx;            // rdx = ch (low byte)
+
+        lea r10, [rip + _cell_attr];
+        mov rcx, 0x07;                     // RENDER_DEFAULT_ATTR
+        mov_b [r10 + rax], rcx;
+
+        xor rax, rax;
+        ret
+      gpc_oob:
+        mov rax, 1;
+        ret
+      }
+    }
+
+  // pdxterm_glyph_blit(x, y, ch) -> u64
+  //   WEAK-in-spirit stub (see file-header note above): libpdx-font
+  //   is not linkable at Wave OO, so this body is inert -- it
+  //   accepts the real (x, y, ch) argument shape and returns 0
+  //   without touching a framebuffer. When libpdx-font lands, only
+  //   this function's body changes; grid_render_all's call site
+  //   stays identical.
+  pub let pdxterm_glyph_blit : (u64, u64, u64) -> u64 !{} @{} =
+    fn (x: u64) (y: u64) (ch: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "pdxterm M2-001 (issue #3) pdxterm_glyph_blit. Inert WEAK-in-spirit stub per this project's established convention for STB_WEAK-shaped fallbacks (paideia-as 0.36 has no true weak-linkage; see tools/user/cat/src/schema_wire.pdx). Accepts (x, y, ch) unconditionally and returns 0 without any memory or register-file effect beyond rax, since libpdx-font is not linkable yet. Two-instruction leaf. Effects declared !{} (strictly narrower than grid_render_all's !{mem, sysreg}, which paideia-as accepts since a callee may declare a subset of what its caller allows).",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // grid_render_all() -- full-window redraw. Walks all 24*80 cells
+  // and blits each glyph via pdxterm_glyph_blit(x, y, ch), with
+  // pixel position x = col*8 (CELL_WIDTH_PX), y = row*16
+  // (CELL_HEIGHT_PX) -- matching Window::CELL_WIDTH_PX/CELL_HEIGHT_PX
+  // in src/window.pdx.
+  pub let grid_render_all : () -> () !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm M2-001 (issue #3) grid_render_all. 3-push prologue (rbx = row, r12 = col, r13 = cell offset) keeps rsp%16 == 0 at the nested pdxterm_glyph_blit call, mirroring RenderIdentity::seed_pattern's identical 3-push shape. Cell offset composed via shift-add (row<<6)+(row<<4)+col, no 2-op imul. Pixel x/y computed via `shl` (col*8, row*16) -- both power-of-2 scales. Byte load via `xor rdx,rdx; mov_b rdx,[ptr+r13]`. All immediates fit imm32 (24, 80, 6, 4, 3). Labels prefixed gra_.",
+      block: {
+        push rbx;                          // rsp%16: 8 -> 0
+        push r12;                          // rsp%16: 0 -> 8
+        push r13;                          // rsp%16: 8 -> 0
+
+        xor rbx, rbx;                      // rbx = row
+      gra_row_loop:
+        cmp rbx, 24;
+        jae gra_done;
+        xor r12, r12;                      // r12 = col
+      gra_col_loop:
+        cmp r12, 80;
+        jae gra_row_next;
+
+        // Cell offset = row*80 + col.
+        mov rax, rbx;
+        mov rcx, rbx;
+        shl rax, 6;
+        shl rcx, 4;
+        add rax, rcx;
+        add rax, r12;
+        mov r13, rax;                      // r13 = cell offset
+
+        lea r10, [rip + _cell_char];
+        xor rdx, rdx;
+        mov_b rdx, [r10 + r13];            // rdx = glyph byte
+
+        mov rdi, r12;
+        shl rdi, 3;                        // x = col * 8
+        mov rsi, rbx;
+        shl rsi, 4;                        // y = row * 16
+        call pdxterm_glyph_blit;           // rdx already holds ch from the load above
+
+        add r12, 1;
+        jmp gra_col_loop;
+      gra_row_next:
+        add rbx, 1;
+        jmp gra_row_loop;
+      gra_done:
+        lea r11, [rip + _grid_render_call_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
 }

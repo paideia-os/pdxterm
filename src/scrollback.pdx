@@ -1,0 +1,100 @@
+// src/scrollback.pdx -- pdxterm Wave OO (R102.M2-003, issue #5)
+// Scrollback module: 256-row scrollback ring.
+//
+// Scope
+// -----
+// `_scrollback` holds 256 rows of 80 bytes each (20480 bytes total,
+// glyph-only -- no attribute lane, matching the "256*80" shape the
+// issue specifies). `sb_push_row(row_ptr)` copies 80 bytes from
+// `row_ptr` into the slot named by `head`, then advances `head`
+// modulo 256 (overwrite-oldest policy, same shape as the kernel-side
+// `_semantic_ring` sys_semantic_send documents in src/syscall.pdx).
+//
+// Wiring note: the issue frames the trigger as "on newline/scroll
+// event". This file provides `sb_push_row` as the stable primitive;
+// it is NOT wired into Ansi::ansi_feed_bytes's newline handling at
+// Wave OO, because src/ansi.pdx's newline path is exercised by three
+// already-CLOSED milestone tests (TestAnsi case 9, CursorMove,
+// ShellEchoRoundtrip) and editing that state machine's control flow
+// without a build/debugger pass available in this landing risks
+// regressing them silently. The wire-up (call sb_push_row from
+// Ansi's row-advance path, passing &_grid_cells[old_row*320]) is
+// left as an explicit follow-up once a build is available to verify
+// the existing ANSI fingerprints still hold.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Scrollback (PascalCase basename).
+//   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+//   - No 2-op `imul`; head*80 = (head<<6)+(head<<4) via shift-add.
+//   - Byte copy via `xor reg,reg; mov_b reg,[ptr]` / `mov_b [ptr],reg`.
+//   - sb_reset and sb_push_row are leaves that never touch a
+//     callee-saved register, so neither needs push/pop.
+//   - Labels prefixed `sb_`.
+
+module Scrollback = structure {
+
+  pub let SB_ROWS  : u64 = 256
+  pub let SB_COLS  : u64 = 80
+
+  pub let mut _scrollback : [u8; 20480] = uninit @align(8)
+  pub let mut head        : u64 = uninit @align(8)
+
+  // sb_reset() -- home the ring head. The backing bytes are not
+  // zeroed (every live slot is fully overwritten by its own
+  // sb_push_row call before it is ever read back).
+  pub let sb_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-003 (issue #5) sb_reset. Home `head` to 0. Leaf; r11 scratch. No push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + head];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // sb_push_row(row_ptr) -> u64
+  //   Copy 80 bytes from row_ptr into _scrollback at slot `head`,
+  //   then advance head modulo 256. Returns the pre-advance slot
+  //   index that was written (so a caller/witness can locate the
+  //   just-written row without re-reading `head`).
+  pub let sb_push_row : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-003 (issue #5) sb_push_row. Leaf: every register used (rax, rcx, rdx, r10, r11) is caller-save, so no push/pop even though a future per-newline caller will invoke this repeatedly. Slot byte offset is head*80, composed as (head<<6)+(head<<4) to avoid 2-op imul per pdx encoder pitfalls. Copy loop is a bounded 80-iteration byte-at-a-time `mov_b` load/store (rdi = row_ptr, untouched across the loop since it is only read via base+index addressing). head wraparound is a single `cmp rcx, 256; jb` gate. All immediates fit imm32 (6, 4, 80, 256). Labels prefixed sb_.",
+      block: {
+        lea r11, [rip + head];
+        mov rax, [r11];                    // rax = current head (pre-advance, also the return value)
+        mov rcx, rax;
+        shl rcx, 6;                        // head * 64
+        shl rax, 4;                        // head * 16
+        add rax, rcx;                      // rax = head * 80
+        lea r10, [rip + _scrollback];
+        add r10, rax;                      // r10 = &_scrollback[head*80]
+
+        xor rcx, rcx;                      // rcx = byte index j
+      sb_copy_loop:
+        cmp rcx, 80;
+        jae sb_copy_done;
+        xor rdx, rdx;
+        mov_b rdx, [rdi + rcx];
+        mov_b [r10 + rcx], rdx;
+        add rcx, 1;
+        jmp sb_copy_loop;
+      sb_copy_done:
+        lea r11, [rip + head];
+        mov rax, [r11];                    // reload pre-advance head into the return-value register
+        mov rcx, rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb sb_advance_store;
+        xor rcx, rcx;
+      sb_advance_store:
+        mov [r11], rcx;
+        ret                                 // rax still holds the pre-advance slot index
+      }
+    }
+
+}

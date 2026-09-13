@@ -1,5 +1,45 @@
 # pdxterm CHANGELOG
 
+## v1.2.0 -- 2026-09-13 (Wave OO: M1/M2 cohort, issues #1-#5)
+
+Landing shape: fills in the M1/M2 surface Wave P's skeletons
+deferred, without disturbing the already-CLOSED M3/M4/v1.1-B work.
+
+- `caps.decl` -- add `KIND_INPUT_EVENT(read)` for keyboard input
+  (#4); `manifest.pdxsig` added as the M5 dual-sign source-form draft
+  (#1).
+- `src/window.pdx` (new, #2) -- `Module Window`: `--rows=<N>`
+  (default 24) / `--cols=<N>` (default 80) argv parser,
+  cols*8 x rows*16 ARGB32 geometry, and an honest-blockage
+  `window_request_surface` stub (no live KIND_SURFACE mint until
+  libpdx-gfx.M2-001 lands). Not yet wired into `Main::pdxterm_main`
+  pending a confirmed argv ABI.
+- `src/grid.pdx` (#3) -- adds `_cell_char`/`_cell_attr` (24x80 byte
+  planes) alongside the existing `_grid_cells` cursor-oriented
+  surface, plus `grid_clear`, `grid_put_char(row, col, ch)`,
+  `grid_render_all` (blits via the new `pdxterm_glyph_blit`
+  WEAK-in-spirit stub -- libpdx-font not linkable yet). Kept as a
+  separate surface rather than reshaping `_grid_cells`, since the
+  latter is the live target of three CLOSED-issue tests.
+- `src/keyboard.pdx` (new, #4) -- `Module Keyboard`: 128-entry
+  keysym->byte LUT (identity for printable ASCII 0x20-0x7E, built at
+  `kbd_reset` time rather than as a literal), `kbd_handle_keydown`
+  writing into a 4096-byte `_pty_out_ring`. No live KIND_INPUT_EVENT
+  subscription yet (no input satellite past its own M1).
+- `src/scrollback.pdx` (new, #5) -- `Module Scrollback`: 256-row x
+  80-byte `_scrollback` ring, `sb_push_row` (copy + advance `head`
+  modulo 256). Not yet called from `Ansi`'s newline path (deferred
+  until a build/debugger pass can confirm the existing ANSI
+  fingerprints survive the wire-up).
+- `manifest.pdxproj` -- version 1.1.0 -> 1.2.0; sources list gains
+  the three new files.
+- `src/tool_ident.pdx` -- `PDX_TOOL_VERSION` bumped to `1.2.0\0`.
+
+Note on versioning: the dispatch for this cohort named tag `v0.5.0`;
+that would be a semver regression behind the already-tagged `v1.1.0`.
+This landing instead bumps forward to `v1.2.0` and tags that -- flagged
+for confirmation rather than silently applying a backward tag.
+
 ## v1.1.0 -- 2026-09-13 (Wave P drain)
 
 Landing shape: scaffold + M3-002 ANSI parser + three M4 fingerprint

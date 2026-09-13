@@ -15,11 +15,22 @@
 # sys_semantic_send (SC+ ID 115, R107-M0-001) enters the fixed 16-slot
 # global ring with no per-caller capability check (kernel side confirms
 # capabilities:{} at src/kernel/core/syscall/handlers/sys_semantic_send.pdx).
+#
+# Wave OO (M1-001/M1-002/M2-001/M2-002/M2-003, issues #1-#5) adds
+# KIND_INPUT_EVENT: src/keyboard.pdx's kbd_handle_keydown consumes
+# keydown events to feed the stub-pty ring. src/window.pdx's argv-
+# driven KIND_SURFACE sizing (cols*8 x rows*16 ARGB32) and
+# src/grid.pdx's grid_put_char/grid_clear/grid_render_all surface
+# stay under the KIND_SURFACE(mint) already declared below; the
+# actual surface-mint syscall wrapper is not yet linked (blocking on
+# libpdx-gfx.M2-001, same dependency STATUS.md already tracks for
+# issue #3), so window_request_surface is an honest-blockage stub.
 
 requires:
 - KIND_USER(read)
 - KIND_SURFACE(read, write, mint)
 - KIND_IPC_ENDPOINT(send, recv)
+- KIND_INPUT_EVENT(read)
 - KIND_PTY(read, write, mint)
 - KIND_PROCESS(spawn)
 

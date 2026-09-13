@@ -1,17 +1,28 @@
 # pdxterm STATUS
 
-Wave: R102 (userland graphical stack) + v1.1 satellite pass.
-Version: **v1.1.0** (Wave P landing 2026-09-13).
+Wave: R102 (userland graphical stack) + v1.1 satellite pass + Wave OO.
+Version: **v1.2.0** (Wave OO landing 2026-09-13, pending build/debugger
+verification -- see note below).
 
 ## Issue-level status
 
-| Issue | Milestone | Status         | Notes                                         |
-| ----- | --------- | -------------- | --------------------------------------------- |
-| #1    | M1-001    | LANDED (v1.1.0)| repo scaffold: .gitignore, manifest.pdxproj, caps.decl, tools/build.sh, src/tool_ident.pdx, src/main.pdx |
-| #2    | M1-002    | PARTIAL (v1.1.0)| caps.decl + PDX_TOOL_NAME; argv parser + window creation deferred to R102.M2 |
-| #3    | M2-001    | DEFERRED       | live libpdx-gfx surface commit + grid math over framebuffer -- blocking on libpdx-gfx.M2-001 |
-| #4    | M2-002    | DEFERRED       | keyboard->bytes pass-through -- blocking on libpdx-event.M2 |
-| #5    | M2-003    | DEFERRED       | scrollback ring (256 rows) -- blocking on grid math |
+NOTE (Wave OO correction): the prior revision of this table marked
+#1 LANDED and #2 PARTIAL against v1.1.0, but `gh issue list` for this
+repo shows #1-#5 all still OPEN at the time this landing started.
+That prior LANDED/PARTIAL marking was inaccurate -- code existed
+(tool_ident.pdx, caps.decl, manifest.pdxproj) that partially overlaps
+#1/#2's scope, but the issues themselves were never closed. This
+table now reports code-landed-pending-verification rather than
+issue-closed; only main/debugger should flip these to CLOSED after a
+build + smoke pass confirms the diff.
+
+| Issue | Milestone | Status                       | Notes                                         |
+| ----- | --------- | ----------------------------- | --------------------------------------------- |
+| #1    | M1-001    | CODE LANDED (v1.2.0), pending verify | repo scaffold complete: README/LICENSE/CHANGELOG, caps.decl, tools/build.sh, manifest.pdxsig (source-form) added this wave |
+| #2    | M1-002    | CODE LANDED (v1.2.0), pending verify | src/window.pdx: `--rows=`/`--cols=` argv parser + KIND_SURFACE geometry; live mint stubbed (blocked on libpdx-gfx.M2-001) |
+| #3    | M2-001    | CODE LANDED (v1.2.0), pending verify | src/grid.pdx: `_cell_char`/`_cell_attr` + grid_put_char/grid_clear/grid_render_all via pdxterm_glyph_blit stub (libpdx-font not linkable yet) |
+| #4    | M2-002    | CODE LANDED (v1.2.0), pending verify | src/keyboard.pdx: 128-entry keysym LUT + `_pty_out_ring`; no live KIND_INPUT_EVENT subscription yet |
+| #5    | M2-003    | CODE LANDED (v1.2.0), pending verify | src/scrollback.pdx: 256x80 `_scrollback` ring + sb_push_row; not yet wired into Ansi's newline path |
 | #6    | M3-001    | DEFERRED       | real KIND_PTY spawn + /bin/shell attach -- blocking on R101 §7.2.3 |
 | #7    | M3-002    | **LANDED (v1.1.0)** | src/ansi.pdx: CSI/SGR/cursor-move state machine + 9-case fingerprint matrix at tests/test_ansi.pdx |
 | #8    | M4-001    | **LANDED (v1.1.0)** | tests/render_identity.pdx: alphabet-repetition seed + FNV-1a-64 digest vs GOLDEN_RENDER_FP; BLAKE3 swap noted for M5 |

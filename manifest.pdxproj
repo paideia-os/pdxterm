@@ -1,18 +1,25 @@
 # pdxterm -- paideia-as build manifest
 #
-# Wave: R102  Milestone: M3 (ANSI parser) + M4 (three smokes) + v1.1-B (semantic pipe)
+# Wave: R102  Milestone: M1 (#1, #2) + M2 (#3, #4, #5) [Wave OO] on top
+# of the previously-landed M3 (ANSI parser) + M4 (three smokes) +
+# v1.1-B (semantic pipe).
 # Doc:  design/graphics/r102-user-plan.md §4.6 in the paideia-os repo.
 #
-# Wave P landing shape: M1/M2 substrate scaffolded as encoder-only
-# skeletons so the M3/M4 smoke bodies compile against a stable
-# module surface. Live libpdx-gfx / libpdx-font / libpdx-event
-# runtime attach lives at R102.M2-001 (issue #3) and does NOT gate
-# the ANSI parser, the golden-fingerprint smokes, or the sysno-115
-# semantic-pipe emit; those three ride entirely on `.rodata`-fixture
-# input and `.bss`-observable output.
+# Wave OO landing shape: fills in the M1/M2 surface that Wave P's
+# skeletons deferred -- argv-driven window geometry + KIND_SURFACE
+# request stub (src/window.pdx, #2), a grid_put_char/grid_clear/
+# grid_render_all cell-plane surface alongside the existing
+# `_grid_cells` skeleton the ANSI parser already consumes
+# (src/grid.pdx, #3), keysym->byte LUT + stub-pty ring
+# (src/keyboard.pdx, #4), and a 256-row scrollback ring
+# (src/scrollback.pdx, #5). None of these wire into Main::pdxterm_main
+# or src/ansi.pdx yet -- see each new file's header for the specific
+# upstream blockage (libpdx-gfx surface mint, the process argv ABI,
+# or "don't touch a CLOSED milestone's state machine without a build
+# pass available").
 
 name        = pdxterm
-version     = 1.1.0
+version     = 1.2.0
 kind        = tool
 entry       = Main::pdxterm_main
 output      = build-out/pdxterm
@@ -21,7 +28,10 @@ caps_decl   = caps.decl
 sources:
   - src/tool_ident.pdx           # Wave F: PDX_TOOL_NAME/PDX_TOOL_VERSION externs
   - src/syscall.pdx              # sys_semantic_send (SC+ ID 115) wrapper (v1.1-B)
-  - src/grid.pdx                 # 80x25 grid + cursor state (M2-001 skeleton)
+  - src/grid.pdx                 # 80x25 cursor grid (M3 skeleton) + M2-001 (#3) put_char/clear/render_all cell planes
+  - src/window.pdx               # M1-002 (#2): argv rows/cols + KIND_SURFACE request stub
+  - src/keyboard.pdx             # M2-002 (#4): keysym->byte LUT + stub-pty ring
+  - src/scrollback.pdx           # M2-003 (#5): 256-row scrollback ring
   - src/ansi.pdx                 # M3-002 (#7): ANSI CSI/SGR/cursor-move state machine
   - src/schema.pdx               # v1.1-B (#14): TermEventRecord@0.1 emit
   - src/main.pdx                 # pdxterm_main entry

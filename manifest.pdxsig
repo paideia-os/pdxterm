@@ -1,0 +1,44 @@
+# pdxterm -- dual-sign manifest (SOURCE FORM, unsigned)
+#
+# Wave: R102  Milestone: M1-001 (issue #1)
+# Doc:  design/graphics/r102-user-plan.md §4.6 in the paideia-os repo.
+#
+# This is the SOURCE FORM of the manifest that R102.M5-001 (issue
+# #12, "signed 1.0.0 release") dual-signs. It mirrors manifest.pdxproj
+# (the paideia-as build manifest already in this tree) plus the two
+# signature slots the M5 release process fills in; it carries no
+# signature bytes yet, since pdxterm has not reached a 1.0.0 release
+# candidate. Re-derive this file from manifest.pdxproj whenever the
+# sources/deps/caps_decl lists there change, keeping the two in sync
+# until the M5 tooling generates manifest.pdxsig mechanically from
+# manifest.pdxproj + a signing key pair.
+#
+# Dual-sign scheme: classical (ed25519) + post-quantum (ML-DSA), per
+# `project_license_and_extensions` / paideia-os PQ-signing discipline
+# (design/paideia-as/v0.20-issue-1025-pq-signing.md). Both slots are
+# `unsigned` placeholders until R102.M5-001.
+
+name        = pdxterm
+version     = 1.2.0
+kind        = tool
+entry       = Main::pdxterm_main
+caps_decl   = caps.decl
+
+sources:
+  - src/tool_ident.pdx
+  - src/syscall.pdx
+  - src/grid.pdx
+  - src/window.pdx
+  - src/keyboard.pdx
+  - src/scrollback.pdx
+  - src/ansi.pdx
+  - src/schema.pdx
+  - src/main.pdx
+
+deps: []
+
+signature:
+  classical_ed25519 = unsigned
+  pq_mldsa          = unsigned
+  signed_at         = unsigned
+  note              = "source-form draft per R102.M1-001 (#1); dual-sign lands at R102.M5-001 (#12)"

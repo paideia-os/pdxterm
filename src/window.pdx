@@ -1,0 +1,259 @@
+// src/window.pdx -- pdxterm Wave OO (R102.M1-002, issue #2)
+// Window module: argv-driven geometry + KIND_SURFACE request stub.
+//
+// Scope
+// -----
+// Parses `--rows=<N>` (default 24) and `--cols=<N>` (default 80)
+// out of argv, computes the pixel geometry the window needs
+// (cols*8 x rows*16, matching Grid's CELL_WIDTH_PX/CELL_HEIGHT_PX at
+// src/grid.pdx), and stages a KIND_SURFACE request. The live
+// surface-mint syscall wrapper is not yet linked (blocking on
+// libpdx-gfx.M2-001, the same upstream dependency STATUS.md already
+// tracks for issue #3), so `window_request_surface` is an honest-
+// blockage stub: it records the intended geometry + format and sets
+// `_window_surface_blocked` rather than fabricating a live mint.
+//
+// Wiring note: `window_init(argc, argv)` is NOT yet called from
+// Main::pdxterm_main -- the process argv ABI (how argc/argv reach
+// the entry point) is not confirmed anywhere else in this tree at
+// Wave OO, so wiring the call site is deferred to whichever
+// milestone lands that ABI, to avoid guessing at Main's signature.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Window (PascalCase basename).
+//   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+//   - No 2-op `imul`; cols*8 and rows*16 are power-of-2 scales done
+//     via `shl`.
+//   - No `and r8..r15, imm64`.
+//   - Byte reads via `xor reg, reg; mov_b reg, [ptr]`.
+//   - window_parse_argv is a leaf: it never touches a callee-saved
+//     register (rbx/rbp/r12-r15), so it needs no push/pop even
+//     though it is called mid-sequence from window_init.
+//   - window_init's 2-push + `sub rsp, 8` prologue keeps rsp%16==0
+//     at its three nested calls (mirrors Grid::grid_write_char's
+//     identical 2-push-plus-pad shape).
+//   - Labels prefixed `win_`.
+
+module Window = structure {
+
+  pub let DEFAULT_ROWS   : u64 = 24
+  pub let DEFAULT_COLS   : u64 = 80
+  pub let CELL_WIDTH_PX  : u64 = 8
+  pub let CELL_HEIGHT_PX : u64 = 16
+
+  // Surface pixel-format tag. ARGB32 = 0 by libpdx-gfx convention
+  // (design/graphics/r102-user-plan.md §2.6); pinned here so the
+  // eventual live mint call composes against a stable constant.
+  pub let SURFACE_FORMAT_ARGB32 : u64 = 0
+
+  // Blockage marker convention: high bit set + a small per-repo
+  // sequence number, matching ShellEchoRoundtrip's
+  // _shell_echo_blockage_kind = 0x8001 (tests/shell_echo_roundtrip.pdx).
+  pub let SURFACE_BLOCKED_GFX_LINK : u64 = 0x8002
+
+  pub let PREFIX_ROWS : [u8; 7] = "--rows="
+  pub let PREFIX_COLS : [u8; 7] = "--cols="
+
+  pub let mut _window_rows            : u64 = uninit @align(8)
+  pub let mut _window_cols            : u64 = uninit @align(8)
+  pub let mut _window_width_px        : u64 = uninit @align(8)
+  pub let mut _window_height_px       : u64 = uninit @align(8)
+  pub let mut _window_surface_blocked : u64 = uninit @align(8)
+
+  // window_reset() -- defaults to 80x24, geometry 640x384, unblocked.
+  pub let window_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M1-002 (issue #2) window_reset. Seed defaults (rows=24, cols=80, width=640=80*8, height=384=24*16) and clear the blockage marker. Leaf; r11 scratch for every rip-relative store. All immediates fit imm32. No push/pop parity.",
+      block: {
+        mov rax, 24;
+        lea r11, [rip + _window_rows];       mov [r11], rax;
+        mov rax, 80;
+        lea r11, [rip + _window_cols];       mov [r11], rax;
+        mov rax, 640;
+        lea r11, [rip + _window_width_px];   mov [r11], rax;
+        mov rax, 384;
+        lea r11, [rip + _window_height_px];  mov [r11], rax;
+        xor rax, rax;
+        lea r11, [rip + _window_surface_blocked]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // window_parse_argv(argc, argv) -> u64
+  //   argv: pointer to argc entries of 8-byte NUL-terminated
+  //   C-string pointers. Scans every entry for a `--rows=` or
+  //   `--cols=` prefix; on match, parses the trailing decimal run
+  //   into _window_rows / _window_cols (unparsed/absent args keep
+  //   whatever window_reset last set). Malformed values (no digits
+  //   after the `=`) leave the field untouched rather than storing
+  //   zero. Always returns 0 (Wave OO: no error signalling for
+  //   malformed values). Recomputes _window_width_px/_window_height_px
+  //   from whatever rows/cols ended up set.
+  pub let window_parse_argv : (u64, u64) -> u64 !{mem} @{} =
+    fn (argc: u64) (argv: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M1-002 (issue #2) window_parse_argv. Leaf: every scratch register used (rax, rcx, rdx, r8, r9, r10, r11) is SysV caller-save, so the function never touches rbx/rbp/r12-r15 and needs no push/pop even though window_init calls it between two other calls. r8 = outer argv index. Per entry, r10 = argv[i] pointer (loaded via [rsi + r9] with r9 = i*8, computed by `shl` not `imul`). Prefix compare is a bounded 7-byte loop against PREFIX_ROWS/PREFIX_COLS (rcx = byte index, byte loads via `xor rax,rax; mov_b rax,[ptr]` per pdx encoder pitfalls). Decimal accumulation avoids 2-op imul: val*10 = val*8 + val*2 via two `shl` plus an `add`. All immediates fit imm32 (7, 32, 48, 57, 126). Labels prefixed win_.",
+      block: {
+        xor r8, r8;
+      win_argv_loop:
+        cmp r8, rdi;
+        jae win_argv_done;
+        mov r9, r8;
+        shl r9, 3;
+        mov r10, [rsi + r9];              // r10 = argv[i]
+
+        // Try "--rows=".
+        xor rcx, rcx;
+        lea r11, [rip + PREFIX_ROWS];
+      win_rows_cmp:
+        cmp rcx, 7;
+        jae win_rows_matched;
+        xor rax, rax;
+        mov_b rax, [r10 + rcx];
+        xor rdx, rdx;
+        mov_b rdx, [r11 + rcx];
+        cmp rax, rdx;
+        jne win_try_cols;
+        add rcx, 1;
+        jmp win_rows_cmp;
+      win_rows_matched:
+        lea r9, [r10 + 7];
+        xor rax, rax;
+      win_rows_digit:
+        xor rdx, rdx;
+        mov_b rdx, [r9];
+        cmp rdx, 48;
+        jb win_rows_store;
+        cmp rdx, 57;
+        ja win_rows_store;
+        sub rdx, 48;
+        mov rcx, rax;
+        shl rax, 3;
+        shl rcx, 1;
+        add rax, rcx;
+        add rax, rdx;
+        add r9, 1;
+        jmp win_rows_digit;
+      win_rows_store:
+        cmp rax, 0;
+        je win_argv_next;
+        lea r11, [rip + _window_rows];
+        mov [r11], rax;
+        jmp win_argv_next;
+
+      win_try_cols:
+        xor rcx, rcx;
+        lea r11, [rip + PREFIX_COLS];
+      win_cols_cmp:
+        cmp rcx, 7;
+        jae win_cols_matched;
+        xor rax, rax;
+        mov_b rax, [r10 + rcx];
+        xor rdx, rdx;
+        mov_b rdx, [r11 + rcx];
+        cmp rax, rdx;
+        jne win_argv_next;
+        add rcx, 1;
+        jmp win_cols_cmp;
+      win_cols_matched:
+        lea r9, [r10 + 7];
+        xor rax, rax;
+      win_cols_digit:
+        xor rdx, rdx;
+        mov_b rdx, [r9];
+        cmp rdx, 48;
+        jb win_cols_store;
+        cmp rdx, 57;
+        ja win_cols_store;
+        sub rdx, 48;
+        mov rcx, rax;
+        shl rax, 3;
+        shl rcx, 1;
+        add rax, rcx;
+        add rax, rdx;
+        add r9, 1;
+        jmp win_cols_digit;
+      win_cols_store:
+        cmp rax, 0;
+        je win_argv_next;
+        lea r11, [rip + _window_cols];
+        mov [r11], rax;
+
+      win_argv_next:
+        add r8, 1;
+        jmp win_argv_loop;
+
+      win_argv_done:
+        // Recompute pixel geometry from whatever rows/cols landed.
+        lea r11, [rip + _window_cols];
+        mov rax, [r11];
+        shl rax, 3;                        // cols * 8
+        lea r11, [rip + _window_width_px];
+        mov [r11], rax;
+        lea r11, [rip + _window_rows];
+        mov rax, [r11];
+        shl rax, 4;                        // rows * 16
+        lea r11, [rip + _window_height_px];
+        mov [r11], rax;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // window_request_surface() -> u64
+  //   Honest-blockage stub: stages the KIND_SURFACE request shape
+  //   (geometry already computed by window_parse_argv/window_reset,
+  //   format = ARGB32) without issuing a live mint syscall -- no
+  //   surface-mint wrapper is linkable at Wave OO (libpdx-gfx.M2-001
+  //   not landed; same blockage STATUS.md tracks for issue #3).
+  //   Sets _window_surface_blocked = SURFACE_BLOCKED_GFX_LINK and
+  //   returns 0.
+  pub let window_request_surface : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M1-002 (issue #2) window_request_surface. Honest-blockage stub matching the ShellEchoRoundtrip convention (tests/shell_echo_roundtrip.pdx): stash the blockage marker unconditionally so a diff of _window_surface_blocked is the audit trail for why no live KIND_SURFACE mint happens yet. Leaf; r11 scratch. No push/pop parity.",
+      block: {
+        mov rax, 0x8002;
+        lea r11, [rip + _window_surface_blocked];
+        mov [r11], rax;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // window_init(argc, argv) -> u64
+  //   Orchestrates window_reset -> window_parse_argv ->
+  //   window_request_surface. Not yet called from Main::pdxterm_main
+  //   (see file header); provided as the stable public entry point
+  //   for whichever milestone lands the argv ABI.
+  pub let window_init : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (argc: u64) (argv: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm M1-002 (issue #2) window_init. 2-push (rbx=argc, r12=argv) preserves the incoming curried args across window_reset/window_parse_argv/window_request_surface, all of which trash caller-save rdi/rsi/rdx/rax/rcx. rsp%16: entry 8 -> push rbx 0 -> push r12 8 -> sub rsp,8 0, identical shape to Grid::grid_write_char's 2-push-plus-pad prologue, so rsp%16==0 at all three nested calls. Returns 0.",
+      block: {
+        push rbx;                          // rsp%16: 8 -> 0
+        push r12;                          // rsp%16: 0 -> 8
+        sub rsp, 8;                        // rsp%16: 8 -> 0
+
+        mov rbx, rdi;                      // rbx = argc
+        mov r12, rsi;                      // r12 = argv
+
+        call window_reset;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        call window_parse_argv;
+
+        call window_request_surface;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

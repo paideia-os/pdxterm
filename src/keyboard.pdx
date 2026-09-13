@@ -1,0 +1,134 @@
+// src/keyboard.pdx -- pdxterm Wave OO (R102.M2-002, issue #4)
+// Keyboard module: KIND_INPUT_EVENT keydown -> byte -> stub-pty ring.
+//
+// Scope
+// -----
+// Translates a keysym into an output byte via a fixed 128-entry LUT
+// (identity for printable ASCII 0x20-0x7E, zero/drop otherwise) and
+// writes the translated byte into a 4096-byte ring (`_pty_out_ring`).
+// There is no real KIND_PTY attach at Wave OO (blocking on
+// R102.M3-001, issue #6): bytes stay in the ring for a later
+// consumer to drain once the real pty exists. The live
+// KIND_INPUT_EVENT subscription (reading keydown records off the
+// event queue and calling `kbd_handle_keydown`) is not wired here
+// either -- no input-event satellite (libpdx-event / svc-input /
+// hw-hid) has scaffolded past its own M1 yet (same blockage
+// STATUS.md already tracks for tests/shell_echo_roundtrip.pdx). This
+// file provides the stable translate+ring seam a later milestone
+// wires the live event source into.
+//
+// LUT construction: the 128-entry table is built at `kbd_reset` time
+// via a bounded loop (LUT[i] = i for 0x20 <= i <= 0x7E, else 0)
+// rather than as a `.rodata` string literal, since a literal
+// covering non-printable byte values would need escape sequences the
+// pdx encoder's single-line string-literal form does not comfortably
+// express.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Keyboard (PascalCase basename).
+//   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+//   - No 2-op `imul`.
+//   - No `and r8..r15, imm64` (the only `and` here targets rax).
+//   - Byte reads/writes via `xor reg, reg; mov_b reg, [ptr]` /
+//     `mov_b [ptr], reg`.
+//   - Both kbd_reset and kbd_handle_keydown are leaves that never
+//     touch a callee-saved register, so neither needs push/pop.
+//   - Labels prefixed `kbd_`.
+
+module Keyboard = structure {
+
+  pub let LUT_SIZE       : u64 = 128
+  pub let RING_SIZE      : u64 = 4096
+  pub let PRINTABLE_LOW  : u64 = 32   // 0x20
+  pub let PRINTABLE_HIGH : u64 = 126  // 0x7E
+
+  pub let mut _kbd_lut          : [u8; 128]  = uninit @align(8)
+  pub let mut _pty_out_ring     : [u8; 4096] = uninit @align(8)
+  pub let mut _pty_out_head     : u64 = uninit @align(8)
+  pub let mut _kbd_bytes_written : u64 = uninit @align(8)
+  pub let mut _kbd_bytes_dropped : u64 = uninit @align(8)
+
+  // kbd_reset() -- (re)build the 128-entry keysym->byte LUT and
+  // home the ring head + observability counters.
+  pub let kbd_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-002 (issue #4) kbd_reset. Build the 128-entry identity-for-printable LUT via a bounded loop (rcx = index 0..128, rax = candidate value). Leaf; every register touched (rax, rcx, r11) is caller-save, so no push/pop. All immediates fit imm32 (128, 32, 126). No `test`; every gate is `cmp reg, imm`.",
+      block: {
+        lea r11, [rip + _kbd_lut];
+        xor rcx, rcx;
+      kbd_lut_loop:
+        cmp rcx, 128;
+        jae kbd_lut_done;
+        mov rax, rcx;
+        cmp rax, 32;
+        jb kbd_lut_zero;
+        cmp rax, 126;
+        ja kbd_lut_zero;
+        mov_b [r11 + rcx], rax;
+        jmp kbd_lut_next;
+      kbd_lut_zero:
+        xor rax, rax;
+        mov_b [r11 + rcx], rax;
+      kbd_lut_next:
+        add rcx, 1;
+        jmp kbd_lut_loop;
+      kbd_lut_done:
+        xor rax, rax;
+        lea r11, [rip + _pty_out_head];        mov [r11], rax;
+        lea r11, [rip + _kbd_bytes_written];   mov [r11], rax;
+        lea r11, [rip + _kbd_bytes_dropped];   mov [r11], rax;
+        ret
+      }
+    }
+
+  // kbd_handle_keydown(keysym) -> u64
+  //   Translate `keysym` (rdi) via the 128-entry LUT (index clamped
+  //   with `and rax, 127`, legal since rax is not r8-r15) and, if
+  //   the LUT entry is non-zero (printable), write it into
+  //   _pty_out_ring at the current head, advancing head modulo 4096.
+  //   Returns 1 if a byte was written, 0 if the keysym translated to
+  //   a dropped (non-printable) entry.
+  pub let kbd_handle_keydown : (u64) -> u64 !{mem} @{} =
+    fn (keysym: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-002 (issue #4) kbd_handle_keydown. Leaf: every register used (rax, rcx, rdx, r10, r11) is caller-save, so no push/pop even though this is called from a future per-event dispatch loop. Index clamp is `and rax, 127` -- rax is not in r8-r15 so the pdx encoder pitfall against wide-and on extended registers does not apply. LUT lookup and ring write both use `xor reg,reg; mov_b reg,[ptr]` / `mov_b [ptr],reg` byte-sized forms. Ring-head wraparound is a single `cmp rcx, 4096; jb` gate (no modulo/imul needed since the increment is always +1). All immediates fit imm32 (127, 0, 1, 4096). Labels prefixed kbd_.",
+      block: {
+        mov rax, rdi;
+        and rax, 127;                        // clamp index into the 128-entry LUT
+        lea r10, [rip + _kbd_lut];
+        xor rdx, rdx;
+        mov_b rdx, [r10 + rax];              // rdx = translated byte (0 = drop)
+        cmp rdx, 0;
+        je kbd_handle_keydown_drop;
+
+        lea r11, [rip + _pty_out_head];
+        mov rcx, [r11];                      // rcx = head
+        lea r10, [rip + _pty_out_ring];
+        mov_b [r10 + rcx], rdx;
+        add rcx, 1;
+        cmp rcx, 4096;
+        jb kbd_handle_keydown_store_head;
+        xor rcx, rcx;
+      kbd_handle_keydown_store_head:
+        mov [r11], rcx;
+
+        lea r11, [rip + _kbd_bytes_written];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        mov rax, 1;
+        ret
+
+      kbd_handle_keydown_drop:
+        lea r11, [rip + _kbd_bytes_dropped];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        xor rax, rax;
+        ret
+      }
+    }
+
+}
