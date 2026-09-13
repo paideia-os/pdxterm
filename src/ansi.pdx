@@ -1,0 +1,581 @@
+// src/ansi.pdx -- pdxterm R102.M3-002 (issue #7)
+// Ansi module: state-machine parser for ESC [ ... m (SGR) and
+// ESC [ ... H (CUP) plus the four cursor-motion CSIs (A/B/C/D).
+//
+// Scope
+// -----
+// A byte-at-a-time state machine that folds a stream of terminal
+// output into three effects on the Grid module:
+//   (1) printable byte (0x20..0x7E, plus 0x0A newline handling) ->
+//       Grid::grid_write_char, cursor advances normally.
+//   (2) CSI SGR (\e[<params>m) -> update Grid::cursor_fg / cursor_bg
+//       per the 8-color palette (30..37, 40..47) plus reset (\e[0m).
+//       Bright variants (90..97, 100..107) map onto the same 8 palette
+//       indices at Wave P; bright bit lives in cursor_fg's high bit
+//       for a future 16-color widen without a schema break.
+//   (3) CSI cursor-move (\e[<n>A / B / C / D / \e[<row>;<col>H) ->
+//       update Grid::cursor_row / cursor_col via Grid::grid_set_cursor
+//       (H) or arithmetic (A/B/C/D). Missing param -> 1 (default per
+//       ECMA-48). Empty param at H -> (1, 1) -> (0, 0) after 1-based
+//       -> 0-based normalisation.
+//
+// Unknown escape sequences (any final byte outside the seven above)
+// are SWALLOWED silently and the state machine returns to GROUND
+// after bumping ansi_unknown_seq_count (the design/graphics/r102-
+// user-plan.md §4.6 §"unknown escape sequences swallowed silently
+// (log to libpdx-audit)" line). Libpdx-audit is not yet linked at
+// Wave P; the bump onto the observability slot is the honest-blockage
+// witness a future audit-wire hook consumes.
+//
+// State machine
+// -------------
+//   STATE_GROUND (0): default. Printable byte -> grid_write_char;
+//                     newline (0x0A) -> cursor to (row+1, 0) with
+//                     row-overflow clamp; ESC (0x1B) -> STATE_ESC;
+//                     other C0 controls swallowed silently.
+//   STATE_ESC    (1): '[' (0x5B) -> STATE_CSI; anything else ->
+//                     GROUND (swallow the ESC + the byte).
+//   STATE_CSI    (2): digit (0x30..0x39) -> accumulate into
+//                     ansi_param_scratch[ansi_param_count] with
+//                     saturating clamp at 9999; ';' (0x3B) -> commit
+//                     current param, advance to next slot (up to
+//                     ANSI_MAX_PARAMS); final byte (0x40..0x7E) ->
+//                     commit current param, dispatch on the final
+//                     byte (m/H/A/B/C/D/f), return to GROUND.
+//
+// Wire discipline
+// ---------------
+// The parser owns its own .bss (ansi_state, ansi_param_scratch,
+// ansi_param_count, ansi_unknown_seq_count). It calls into Grid via
+// public seams only (grid_write_char, grid_set_cursor + direct
+// cursor_fg/cursor_bg writes). No global state outside these two
+// modules is touched.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Ansi (PascalCase basename).
+//   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+//   - cmp reg, imm <= 0x7FFFFFFF (highest imm is 9999).
+//   - r11 is scratch (every rip-relative lea).
+//   - Byte reads via `xor rax, rax; mov_b rax, [ptr]` in the byte
+//     accessor helpers.
+//   - No 2-op `imul r, imm` (parameter accumulation uses shl+add for
+//     the `* 10` multiplier: v * 10 = (v << 3) + (v << 1)).
+//   - No `and reg, imm64` on r8..r15 (parser body issues zero `and`
+//     instructions; byte-width discipline uses `xor reg, reg`
+//     followed by `mov_b` for reads).
+//   - Labels prefixed `ansi_` to avoid the reserved-keyword collisions
+//     the paideia-as parser refuses on (`loop`, `if`, etc.).
+//   - SysV push/pop parity: each non-leaf function documents its
+//     rsp%16 gate; leaves take no callee-save.
+
+module Ansi = structure {
+
+  // State constants.
+  pub let ANSI_STATE_GROUND : u64 = 0
+  pub let ANSI_STATE_ESC    : u64 = 1
+  pub let ANSI_STATE_CSI    : u64 = 2
+
+  // Parameter buffer size. ECMA-48 CSI accepts up to 16 params in
+  // practice; we cap at 8 (enough for CUP + SGR chains the shell
+  // emits) and drop overflow silently.
+  pub let ANSI_MAX_PARAMS : u64 = 8
+
+  // Saturating clamp on a single param value. Prevents an attacker-
+  // supplied 40-digit run from wrapping the u64 accumulator.
+  pub let ANSI_PARAM_CLAMP : u64 = 9999
+
+  // .bss parser state.
+  pub let mut ansi_state              : u64      = uninit @align(8)
+  pub let mut ansi_param_scratch      : [u64; 8] = uninit @align(8)
+  pub let mut ansi_param_count        : u64      = uninit @align(8)
+  pub let mut ansi_current_has_digit  : u64      = uninit @align(8)
+  pub let mut ansi_unknown_seq_count  : u64      = uninit @align(8)
+  pub let mut ansi_bytes_consumed     : u64      = uninit @align(8)
+
+  // ansi_reset() -- zero every parser slot. Called at every M4
+  // smoke fixture entry so tests run against a known-clean parser.
+  pub let ansi_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M3-002 ansi_reset. Zero all parser .bss slots. Bounded 8-slot loop for ansi_param_scratch. r11 scratch for rip-relative lea. rcx as loop counter. Leaf; no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + ansi_state];               mov [r11], rax;
+        lea r11, [rip + ansi_param_count];         mov [r11], rax;
+        lea r11, [rip + ansi_current_has_digit];   mov [r11], rax;
+        lea r11, [rip + ansi_unknown_seq_count];   mov [r11], rax;
+        lea r11, [rip + ansi_bytes_consumed];      mov [r11], rax;
+        // Zero the 8-slot param scratch.
+        lea r11, [rip + ansi_param_scratch];
+        xor rcx, rcx;
+      ansi_reset_param_loop:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb ansi_reset_param_loop;
+        ret
+      }
+    }
+
+  // ansi_feed_byte(b) -> ()
+  //   Advance the state machine by one input byte. The single public
+  //   seam every caller uses. Implements the state table in the file
+  //   header. Uses no callee-save registers itself but calls into
+  //   Grid, so it takes a 1-push (align) prologue.
+  //
+  // Register plan:
+  //   rbx = input byte (preserved across the cmp/jmp cascade)
+  //   r11 = scratch for every lea
+  //   rax = state / param value / call return
+  pub let ansi_feed_byte : (u64) -> () !{mem} @{} =
+    fn (b: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M3-002 (issue #7) ansi_feed_byte. Single-byte state-machine advance. 1-push (rbx) = 8 bytes; entry rsp%16 == 8 -> post-push rsp%16 == 0 for every nested call (grid_write_char, grid_set_cursor, ansi_dispatch_final). rbx preserves the input byte across every gate. No `test`; every gate is `cmp reg, imm`. Every imm fits imm32 (highest is 0x7E = 126). Labels prefixed ansi_. Callees: Grid::grid_write_char (arity 1), Grid::grid_set_cursor (arity 2), Ansi::ansi_dispatch_final (arity 1) -- all sit at rsp%16 == 0 by this prologue.",
+      block: {
+        push rbx;                                  // rsp%16: 8 -> 0
+
+        mov rbx, rdi;                              // rbx = byte
+
+        // Bump bytes_consumed observability.
+        lea r11, [rip + ansi_bytes_consumed];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // Dispatch on current state.
+        lea r11, [rip + ansi_state];
+        mov rax, [r11];
+        cmp rax, 0;                                // STATE_GROUND?
+        je ansi_feed_ground;
+        cmp rax, 1;                                // STATE_ESC?
+        je ansi_feed_esc;
+        // Else: STATE_CSI (or unknown state -- fall to CSI handler).
+        jmp ansi_feed_csi;
+
+      // ---- STATE_GROUND ----
+      ansi_feed_ground:
+        // ESC (0x1B) -> transition to STATE_ESC.
+        cmp rbx, 27;                               // 0x1B
+        jne ansi_feed_ground_not_esc;
+        mov rax, 1;
+        lea r11, [rip + ansi_state];               mov [r11], rax;
+        jmp ansi_feed_done;
+      ansi_feed_ground_not_esc:
+        // Newline (0x0A) -> cursor to (row+1, 0).
+        cmp rbx, 10;
+        jne ansi_feed_ground_not_newline;
+        // rdi = cursor_row + 1; rsi = 0.
+        lea r11, [rip + cursor_row];
+        mov rdi, [r11];
+        add rdi, 1;
+        xor rsi, rsi;
+        call grid_set_cursor;
+        jmp ansi_feed_done;
+      ansi_feed_ground_not_newline:
+        // Printable byte (0x20 .. 0x7E) -> grid_write_char.
+        cmp rbx, 32;                               // 0x20
+        jb ansi_feed_done;                         // C0 control (not NL/ESC): swallow
+        cmp rbx, 126;                              // 0x7E
+        ja ansi_feed_done;                         // DEL and above: swallow at Wave P
+        mov rdi, rbx;
+        call grid_write_char;
+        jmp ansi_feed_done;
+
+      // ---- STATE_ESC ----
+      ansi_feed_esc:
+        // '[' (0x5B) -> transition to STATE_CSI (and reset params).
+        cmp rbx, 91;                               // 0x5B
+        jne ansi_feed_esc_not_bracket;
+        // Reset params in-line (avoid a nested call from the ESC path).
+        xor rax, rax;
+        lea r11, [rip + ansi_param_count];         mov [r11], rax;
+        lea r11, [rip + ansi_current_has_digit];   mov [r11], rax;
+        lea r11, [rip + ansi_param_scratch];       mov [r11], rax;
+        mov rax, 2;                                // STATE_CSI
+        lea r11, [rip + ansi_state];               mov [r11], rax;
+        jmp ansi_feed_done;
+      ansi_feed_esc_not_bracket:
+        // Any other byte after ESC: swallow, back to GROUND.
+        lea r11, [rip + ansi_unknown_seq_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        xor rax, rax;
+        lea r11, [rip + ansi_state];               mov [r11], rax;
+        jmp ansi_feed_done;
+
+      // ---- STATE_CSI ----
+      ansi_feed_csi:
+        // Digit (0x30 .. 0x39) -> accumulate into current param slot.
+        cmp rbx, 48;                               // '0'
+        jb ansi_feed_csi_not_digit;
+        cmp rbx, 57;                               // '9'
+        ja ansi_feed_csi_not_digit;
+
+        // v = ansi_param_scratch[count]; v = v * 10 + (b - '0');
+        // clamp at ANSI_PARAM_CLAMP.
+        lea r11, [rip + ansi_param_count];
+        mov rcx, [r11];                            // rcx = count
+        lea r11, [rip + ansi_param_scratch];
+        mov rax, [r11 + rcx * 8];                  // rax = v
+        // v * 10 = (v << 3) + (v << 1) -- no 2-op imul.
+        mov rdx, rax;
+        shl rax, 3;
+        shl rdx, 1;
+        add rax, rdx;                              // rax = v * 10
+        // digit = b - '0'
+        mov rdx, rbx;
+        sub rdx, 48;
+        add rax, rdx;                              // rax = v * 10 + digit
+        // Clamp.
+        cmp rax, 9999;
+        jbe ansi_feed_csi_digit_store;
+        mov rax, 9999;
+      ansi_feed_csi_digit_store:
+        mov [r11 + rcx * 8], rax;
+        // Mark current-param has-digit so an empty param stays 0 while
+        // a bare `H` (no digits at all) can distinguish from `\e[0H`.
+        mov rax, 1;
+        lea r11, [rip + ansi_current_has_digit];
+        mov [r11], rax;
+        jmp ansi_feed_done;
+      ansi_feed_csi_not_digit:
+        // Semicolon (0x3B) -> advance to next param slot.
+        cmp rbx, 59;
+        jne ansi_feed_csi_not_semi;
+        // count = min(count + 1, ANSI_MAX_PARAMS - 1); zero next slot.
+        lea r11, [rip + ansi_param_count];
+        mov rcx, [r11];
+        add rcx, 1;
+        cmp rcx, 7;                                // ANSI_MAX_PARAMS - 1
+        jbe ansi_feed_csi_semi_commit;
+        mov rcx, 7;
+      ansi_feed_csi_semi_commit:
+        mov [r11], rcx;
+        lea r11, [rip + ansi_param_scratch];
+        xor rax, rax;
+        mov [r11 + rcx * 8], rax;
+        lea r11, [rip + ansi_current_has_digit];
+        mov [r11], rax;
+        jmp ansi_feed_done;
+      ansi_feed_csi_not_semi:
+        // Final byte (0x40 .. 0x7E) -> dispatch, return to GROUND.
+        cmp rbx, 64;                               // 0x40
+        jb ansi_feed_csi_swallow;
+        cmp rbx, 126;                              // 0x7E
+        ja ansi_feed_csi_swallow;
+        mov rdi, rbx;
+        call ansi_dispatch_final;
+        xor rax, rax;
+        lea r11, [rip + ansi_state];               mov [r11], rax;
+        jmp ansi_feed_done;
+      ansi_feed_csi_swallow:
+        lea r11, [rip + ansi_unknown_seq_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        xor rax, rax;
+        lea r11, [rip + ansi_state];               mov [r11], rax;
+
+      ansi_feed_done:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ansi_dispatch_final(final_byte) -> ()
+  //   Called from STATE_CSI on any final byte in [0x40, 0x7E].
+  //   Dispatches on the final byte:
+  //     'm' (0x6D)         -> SGR (walks the param scratch, updates fg/bg)
+  //     'H' or 'f' (0x48/0x66) -> CUP (row;col; 1-based)
+  //     'A' (0x41)         -> CUU (cursor up)
+  //     'B' (0x42)         -> CUD (cursor down)
+  //     'C' (0x43)         -> CUF (cursor forward)
+  //     'D' (0x44)         -> CUB (cursor back)
+  //     other              -> bump unknown_seq_count, no-op
+  //
+  //   Missing count param defaults to 1 (per ECMA-48 §8.3).
+  pub let ansi_dispatch_final : (u64) -> () !{mem} @{} =
+    fn (final_byte: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M3-002 ansi_dispatch_final. Dispatch on the CSI final byte. 1-push (rbx = final_byte) = 8 bytes; entry rsp%16 == 8 -> post-push rsp%16 == 0 for every nested call (ansi_apply_sgr, grid_set_cursor, ansi_read_delta_one). No `test`; every gate is `cmp reg, imm`. Every imm fits imm32 (highest is 0x7E = 126). Labels prefixed adf_. rdx is the delta accumulator for the A/B/C/D cursor motions (defaults to 1 when has_digit == 0). All cursor-motion computations use `cmp reg, 0`/`sub reg, reg` shape (no `test`). Clamping delegated to Grid::grid_set_cursor.",
+      block: {
+        push rbx;                                  // rsp%16: 8 -> 0
+        mov rbx, rdi;                              // rbx = final byte
+
+        // Dispatch table.
+        cmp rbx, 109;                              // 'm'
+        je adf_sgr;
+        cmp rbx, 72;                               // 'H'
+        je adf_cup;
+        cmp rbx, 102;                              // 'f'
+        je adf_cup;
+        cmp rbx, 65;                               // 'A'
+        je adf_up;
+        cmp rbx, 66;                               // 'B'
+        je adf_down;
+        cmp rbx, 67;                               // 'C'
+        je adf_forward;
+        cmp rbx, 68;                               // 'D'
+        je adf_back;
+        // Unknown final byte: bump counter, return.
+        lea r11, [rip + ansi_unknown_seq_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp adf_done;
+
+      adf_sgr:
+        call ansi_apply_sgr;
+        jmp adf_done;
+
+      adf_cup:
+        // CUP: two params (row;col), 1-based, default 1.
+        // Load param[0] and param[1] with default 1 when count == 0
+        // or absent.
+        lea r11, [rip + ansi_param_count];
+        mov rcx, [r11];                            // rcx = count (index of active)
+        lea r11, [rip + ansi_current_has_digit];
+        mov rax, [r11];                            // rax = has_digit
+        // Effective_count = count + (has_digit ? 1 : 0).
+        cmp rax, 0;
+        je adf_cup_count_ok;
+        add rcx, 1;
+      adf_cup_count_ok:
+        // row = (effective_count >= 1) ? param[0] : 0; then row = row ? row-1 : 0
+        // col = (effective_count >= 2) ? param[1] : 0; then col = col ? col-1 : 0
+        lea r11, [rip + ansi_param_scratch];
+        xor rdi, rdi;
+        xor rsi, rsi;
+        cmp rcx, 1;
+        jb adf_cup_call;
+        mov rdi, [r11 + 0];                        // param[0]
+        cmp rcx, 2;
+        jb adf_cup_have_row;
+        mov rsi, [r11 + 8];                        // param[1]
+      adf_cup_have_row:
+        // Normalise 1-based -> 0-based; treat 0 as 0.
+        cmp rdi, 0;
+        je adf_cup_col_norm;
+        sub rdi, 1;
+      adf_cup_col_norm:
+        cmp rsi, 0;
+        je adf_cup_call;
+        sub rsi, 1;
+      adf_cup_call:
+        call grid_set_cursor;
+        jmp adf_done;
+
+      adf_up:
+        // rdi = max(row - delta, 0); rsi = col
+        call ansi_read_delta_one;                  // rax = delta
+        mov rcx, rax;
+        lea r11, [rip + cursor_row];               mov rdi, [r11];
+        cmp rdi, rcx;
+        jae adf_up_sub;
+        xor rdi, rdi;
+        jmp adf_up_call;
+      adf_up_sub:
+        sub rdi, rcx;
+      adf_up_call:
+        lea r11, [rip + cursor_col];               mov rsi, [r11];
+        call grid_set_cursor;
+        jmp adf_done;
+
+      adf_down:
+        call ansi_read_delta_one;                  // rax = delta
+        lea r11, [rip + cursor_row];               mov rdi, [r11];
+        add rdi, rax;
+        lea r11, [rip + cursor_col];               mov rsi, [r11];
+        call grid_set_cursor;                      // Grid clamps to GRID_ROWS-1
+        jmp adf_done;
+
+      adf_forward:
+        call ansi_read_delta_one;                  // rax = delta
+        lea r11, [rip + cursor_col];               mov rsi, [r11];
+        add rsi, rax;
+        lea r11, [rip + cursor_row];               mov rdi, [r11];
+        call grid_set_cursor;                      // Grid clamps to GRID_COLS-1
+        jmp adf_done;
+
+      adf_back:
+        call ansi_read_delta_one;                  // rax = delta
+        mov rcx, rax;
+        lea r11, [rip + cursor_col];               mov rsi, [r11];
+        cmp rsi, rcx;
+        jae adf_back_sub;
+        xor rsi, rsi;
+        jmp adf_back_call;
+      adf_back_sub:
+        sub rsi, rcx;
+      adf_back_call:
+        lea r11, [rip + cursor_row];               mov rdi, [r11];
+        call grid_set_cursor;
+
+      adf_done:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ansi_read_delta_one() -> u64
+  //   Return param[0] if the parser saw at least one digit; else 1
+  //   (ECMA-48 default for A/B/C/D). If param[0] == 0 (explicit
+  //   \e[0A), treat as 1 per the same convention.
+  pub let ansi_read_delta_one : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M3-002 ansi_read_delta_one. Return param[0] with default-1 semantics for missing / zero params. Leaf; r11 scratch; no push/pop parity. All imm are 0/1.",
+      block: {
+        lea r11, [rip + ansi_current_has_digit];
+        mov rax, [r11];
+        cmp rax, 0;
+        je ansi_read_delta_one_default;
+        lea r11, [rip + ansi_param_scratch];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne ansi_read_delta_one_out;
+      ansi_read_delta_one_default:
+        mov rax, 1;
+      ansi_read_delta_one_out:
+        ret
+      }
+    }
+
+  // ansi_apply_sgr() -> ()
+  //   Walk the param scratch and apply each param onto cursor_fg /
+  //   cursor_bg. Supported params at Wave P:
+  //     0                -> reset (fg=7, bg=0)
+  //     30..37           -> fg = param - 30
+  //     40..47           -> bg = param - 40
+  //     90..97           -> fg = param - 90  (bright mapped to 8-index at v1)
+  //     100..107         -> bg = param - 100 (bright mapped to 8-index at v1)
+  //   Every other param (bold=1, italic=3, 256-color=38/48, etc.)
+  //   is swallowed; the loop bumps ansi_unknown_seq_count once per
+  //   unrecognised param so ecosystem tooling can diagnose gaps.
+  pub let ansi_apply_sgr : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M3-002 ansi_apply_sgr. Walk ansi_param_scratch[0..effective_count] and apply per-param. Leaf with respect to callees (no nested call); rbx pushed once as loop cursor. 1-push = 8 bytes; entry rsp%16 == 8 -> post-push rsp%16 == 0 at ret. Every imm fits imm32 (highest is 107). No `test`; every gate is `cmp reg, imm`. Labels prefixed asgr_.",
+      block: {
+        push rbx;                                  // rsp%16: 8 -> 0
+
+        // effective_count = count + (has_digit ? 1 : 0). Empty SGR (\e[m)
+        // means an implicit `0` (reset) -- handled via a synthetic
+        // count = 1 with param[0] = 0.
+        lea r11, [rip + ansi_param_count];
+        mov rcx, [r11];
+        lea r11, [rip + ansi_current_has_digit];
+        mov rax, [r11];
+        cmp rax, 0;
+        je asgr_count_ok;
+        add rcx, 1;
+      asgr_count_ok:
+        cmp rcx, 0;
+        jne asgr_walk_init;
+        // Empty CSI: synthesise one reset.
+        mov rcx, 1;
+        lea r11, [rip + ansi_param_scratch];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+      asgr_walk_init:
+        xor rbx, rbx;                              // rbx = index
+      asgr_walk:
+        cmp rbx, rcx;
+        jae asgr_done;
+        lea r11, [rip + ansi_param_scratch];
+        mov rax, [r11 + rbx * 8];                  // rax = param
+        // Reset (0).
+        cmp rax, 0;
+        jne asgr_not_reset;
+        mov rdx, 7;
+        lea r11, [rip + cursor_fg];                mov [r11], rdx;
+        xor rdx, rdx;
+        lea r11, [rip + cursor_bg];                mov [r11], rdx;
+        jmp asgr_step;
+      asgr_not_reset:
+        // fg 30..37.
+        cmp rax, 30;
+        jb asgr_check_fg_bright;
+        cmp rax, 37;
+        ja asgr_check_fg_bright;
+        sub rax, 30;
+        lea r11, [rip + cursor_fg];                mov [r11], rax;
+        jmp asgr_step;
+      asgr_check_fg_bright:
+        // fg 90..97.
+        cmp rax, 90;
+        jb asgr_check_bg;
+        cmp rax, 97;
+        ja asgr_check_bg;
+        sub rax, 90;
+        lea r11, [rip + cursor_fg];                mov [r11], rax;
+        jmp asgr_step;
+      asgr_check_bg:
+        // bg 40..47.
+        cmp rax, 40;
+        jb asgr_check_bg_bright;
+        cmp rax, 47;
+        ja asgr_check_bg_bright;
+        sub rax, 40;
+        lea r11, [rip + cursor_bg];                mov [r11], rax;
+        jmp asgr_step;
+      asgr_check_bg_bright:
+        // bg 100..107.
+        cmp rax, 100;
+        jb asgr_unknown;
+        cmp rax, 107;
+        ja asgr_unknown;
+        sub rax, 100;
+        lea r11, [rip + cursor_bg];                mov [r11], rax;
+        jmp asgr_step;
+      asgr_unknown:
+        lea r11, [rip + ansi_unknown_seq_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+      asgr_step:
+        add rbx, 1;
+        jmp asgr_walk;
+
+      asgr_done:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ansi_feed_bytes(ptr, len) -> ()
+  //   Convenience walker: feed `len` bytes from `ptr` into the state
+  //   machine. Used by the smokes and by libpdx-audit-style log
+  //   consumers.
+  pub let ansi_feed_bytes : (u64, u64) -> () !{mem} @{} =
+    fn (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M3-002 ansi_feed_bytes. Walk `len` bytes at `ptr`, calling ansi_feed_byte on each. 3-push prologue (rbx=ptr, r12=len, r13=idx) keeps rsp%16 == 0 at the nested ansi_feed_byte call (3 pushes = 24 bytes; entry rsp%16 == 8 -> post-push rsp%16 == 0). Byte load via xor rax, rax; mov_b rax, [ptr+idx] per pdx encoder pitfalls. Labels prefixed afb_.",
+      block: {
+        push rbx;                                  // rsp%16: 8 -> 0
+        push r12;                                  // rsp%16: 0 -> 8
+        push r13;                                  // rsp%16: 8 -> 0
+        mov rbx, rdi;                              // rbx = ptr
+        mov r12, rsi;                              // r12 = len
+        xor r13, r13;                              // r13 = idx
+      afb_loop:
+        cmp r13, r12;
+        jae afb_done;
+        xor rax, rax;
+        mov_b rax, [rbx + r13];
+        mov rdi, rax;
+        call ansi_feed_byte;
+        add r13, 1;
+        jmp afb_loop;
+      afb_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

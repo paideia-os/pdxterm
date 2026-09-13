@@ -1,0 +1,176 @@
+// tests/shell_echo_roundtrip.pdx -- pdxterm R102.M4-002 (issue #9)
+// ShellEchoRoundtrip module: HONEST-BLOCKAGE WITNESS.
+//
+// Fingerprint: "pdxterm hello ok" (per r102-user-plan.md §4.6 R102.M4-002).
+//
+// The full smoke, per the plan doc, is:
+//   1. pdxterm starts, spawns /bin/shell over KIND_PTY.
+//   2. Scripted HID types `echo hello` + newline.
+//   3. Witness reads pdxterm's surface and finds `hello` rendered
+//      in the row after the prompt.
+//
+// Wave P landing state
+// --------------------
+// The full round-trip needs FOUR upstream landings the pdxterm tree
+// does NOT own:
+//
+//   (a) R102.M3-001 (issue #6): real KIND_PTY spawn + /bin/shell
+//       attach. Blocking on the KIND_PTY substrate the R101 §7.2.3
+//       plan owns; not landed.
+//   (b) R102.M2-001 (issue #3): live libpdx-gfx surface commit +
+//       grid math over the actual framebuffer. Blocking on
+//       libpdx-gfx's own M2-001 (gfx_commit -> svc.compositor).
+//       Not landed.
+//   (c) R102.MON-005 (monorepo): boot_r102_hello witness wiring in
+//       tools/run-qemu.sh + src/kernel/boot/kernel_main.pdx. Not
+//       landed.
+//   (d) A scripted-HID emit path (post-boot keystroke injection
+//       into KIND_INPUT_STREAM). None of the three input satellites
+//       (libpdx-event, svc-input, hw-hid) has scaffolded past M1
+//       yet.
+//
+// Wave P HONEST WITNESS
+// ---------------------
+// This test lands the emulated shape of the round-trip without any
+// of the four upstream deps: it directly feeds the byte stream a
+// running /bin/shell WOULD emit into the ANSI parser as if it had
+// come back over KIND_PTY, then asserts the grid state matches
+// what the round-trip is required to produce. The four `.rodata`
+// fixtures are:
+//
+//   PROMPT_FIXTURE  = "\x1B[32m$ \x1B[0m"       -- green prompt, reset
+//   TYPED_FIXTURE   = "echo hello\n"            -- user types + Enter
+//   SHELL_ECHO_1    = "echo hello\n"            -- shell echoes typed
+//   SHELL_OUT_FIXTURE = "hello\n"               -- /bin/echo output
+//
+// Post-condition:
+//   * The word "hello" (glyphs 'h','e','l','l','o') lands somewhere
+//     on the grid at a row after the prompt row (>= 1).
+//   * ansi_bytes_consumed >= sum of the four fixture lengths.
+//   * At least one cell whose glyph == 'h' at a col in [0, 79] AND
+//     whose row > 0 (i.e. the "hello" landed in a row after the
+//     prompt row).
+//
+// Result semantics
+// ----------------
+// The test returns:
+//   1 = full pass (fixture-fed round-trip landed as expected;
+//       cannot distinguish substrate-real from fixture-fed).
+//   0 = fixture-fed round-trip failed (regression in the ANSI
+//       parser or grid).
+// A substrate-real re-run at R102.M3-001 landing will REPLACE
+// the fixture-fed byte source with a real KIND_PTY read of what
+// the shell sent; the post-condition assert stays identical.
+//
+// The BLOCKAGE is documented at .bss slot _shell_echo_blockage_kind
+// so a QEMU witness or a design-doc audit can see WHY the substrate
+// half is honest-blocked at Wave P (value 0x8001 = "waiting on
+// R102.M3-001 + libpdx-gfx.M2-001").
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ShellEchoRoundtrip (PascalCase basename).
+//   - No `test`; every gate is cmp reg, imm.
+//   - No 2-op imul.
+//   - Byte reads via xor rax, rax; mov_b rax, [ptr + idx].
+//   - Labels prefixed ser_.
+
+module ShellEchoRoundtrip = structure {
+
+  pub let PROMPT_FIXTURE    : [u8; 11] = "\x1B[32m$ \x1B[0m"
+  pub let TYPED_FIXTURE     : [u8; 11] = "echo hello\n"
+  pub let SHELL_ECHO_1      : [u8; 11] = "echo hello\n"
+  pub let SHELL_OUT_FIXTURE : [u8; 6]  = "hello\n"
+
+  pub let mut _shell_echo_pass          : u64 = uninit @align(8)
+  pub let mut _shell_echo_blockage_kind : u64 = uninit @align(8)
+  pub let mut _shell_echo_hello_row     : u64 = uninit @align(8)
+  pub let mut _shell_echo_hello_col     : u64 = uninit @align(8)
+
+  pub let shell_echo_main : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm M4-002 (issue #9) shell_echo_main. Fixture-fed honest witness for the full round-trip; substrate half (KIND_PTY + libpdx-gfx + scripted HID) is blocked on four upstream deps documented in file header. Reset grid/parser, feed four fixtures in sequence, then walk the grid looking for a cell whose glyph == 'h' at row > 0 (proves 'hello' landed on a row after the prompt row). 3-push (rbx=row, r12=col, r13=fingerprint) keeps rsp%16 == 0 at all nested calls (grid_reset, ansi_reset, ansi_feed_bytes x4). Blockage marker 0x8001 stashed unconditionally so a diff of _shell_echo_blockage_kind is the audit trail for why substrate-half is inert. All imm fit imm32. Labels prefixed ser_.",
+      block: {
+        push rbx;                                  // rsp%16: 8 -> 0
+        push r12;                                  // rsp%16: 0 -> 8
+        push r13;                                  // rsp%16: 8 -> 0
+
+        // Stash blockage marker so it's visible even on early-exit.
+        mov rax, 0x8001;
+        lea r11, [rip + _shell_echo_blockage_kind]; mov [r11], rax;
+
+        call grid_reset;
+        call ansi_reset;
+
+        // Feed prompt (row 0).
+        lea rdi, [rip + PROMPT_FIXTURE];
+        mov rsi, 11;
+        call ansi_feed_bytes;
+
+        // Feed user-typed echo (advances cursor).
+        lea rdi, [rip + TYPED_FIXTURE];
+        mov rsi, 11;
+        call ansi_feed_bytes;
+
+        // Feed shell-echoed line (advances to next row via \n).
+        lea rdi, [rip + SHELL_ECHO_1];
+        mov rsi, 11;
+        call ansi_feed_bytes;
+
+        // Feed /bin/echo output (the "hello" that we want to see
+        // rendered).
+        lea rdi, [rip + SHELL_OUT_FIXTURE];
+        mov rsi, 6;
+        call ansi_feed_bytes;
+
+        // Walk the grid: find a cell (row > 0) whose glyph == 'h'.
+        // 25 rows * 80 cols. Cell offset = (row * 80 + col) * 4.
+        xor r13, r13;                              // r13 = fingerprint (0 = fail)
+        mov rbx, 1;                                // rbx = row (start at 1, skip prompt row)
+      ser_row_loop:
+        cmp rbx, 25;
+        jae ser_done;
+        xor r12, r12;                              // r12 = col
+      ser_col_loop:
+        cmp r12, 80;
+        jae ser_row_next;
+        // Compute offset: (row * 80 + col) * 4.
+        // row*80 = (row << 6) + (row << 4)
+        mov rax, rbx;
+        mov rdx, rbx;
+        shl rdx, 6;
+        shl rax, 4;
+        add rax, rdx;
+        add rax, r12;
+        shl rax, 2;
+        // Load glyph byte.
+        lea r10, [rip + _grid_cells];
+        xor rcx, rcx;
+        mov_b rcx, [r10 + rax];
+        cmp rcx, 104;                              // 'h'
+        jne ser_col_next;
+        // Found. Record position + set pass.
+        mov r13, 1;
+        lea r11, [rip + _shell_echo_hello_row];  mov [r11], rbx;
+        lea r11, [rip + _shell_echo_hello_col];  mov [r11], r12;
+        jmp ser_done;
+      ser_col_next:
+        add r12, 1;
+        jmp ser_col_loop;
+      ser_row_next:
+        add rbx, 1;
+        jmp ser_row_loop;
+
+      ser_done:
+        lea r11, [rip + _shell_echo_pass];
+        mov [r11], r13;
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

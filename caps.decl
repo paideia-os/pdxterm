@@ -1,0 +1,32 @@
+# pdxterm -- caps.decl
+#
+# Wave: R102 (userland graphical stack).
+# Doc:  design/graphics/r102-user-plan.md §2.6 / §4.6 in the paideia-os
+#       monorepo. Format: R90-XREPO.013.M1-001 line-oriented grammar
+#       (paideia-os design/architecture/caps-decl-format.md).
+#
+# Role: framebuffer terminal emulator. Renders a text grid onto its own
+#       KIND_SURFACE and forwards keystrokes to a child /bin/shell over
+#       KIND_PTY. Consumes svc-compositor via KIND_IPC_ENDPOINT.
+#
+# Wave P (M3 ANSI parser + M4 smokes + v1.1-B semantic pipe) does not
+# add any new cap: the ANSI state machine is a pure text transducer,
+# the golden-fingerprint smokes exercise `.rodata` fixture input, and
+# sys_semantic_send (SC+ ID 115, R107-M0-001) enters the fixed 16-slot
+# global ring with no per-caller capability check (kernel side confirms
+# capabilities:{} at src/kernel/core/syscall/handlers/sys_semantic_send.pdx).
+
+requires:
+- KIND_USER(read)
+- KIND_SURFACE(read, write, mint)
+- KIND_IPC_ENDPOINT(send, recv)
+- KIND_PTY(read, write, mint)
+- KIND_PROCESS(spawn)
+
+# The v1.1-B TermEventRecord@0.1 emission traffics the fixed ring; the
+# consumer is a future subscriber ring in libpdx-semantic-pipe. Naming
+# the schema here so the manifest-verify gate at exec surfaces it to
+# ecosystem tooling regardless of whether a consumer is present at run
+# time.
+declares_output_schemas:
+- TermEventRecord@0.1

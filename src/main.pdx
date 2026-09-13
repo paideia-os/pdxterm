@@ -1,0 +1,40 @@
+// src/main.pdx -- pdxterm Wave P entry-point skeleton.
+// Main module: pdxterm_main entry, wires reset -> feed-fixture ->
+// (future) run-loop shape.
+//
+// Wave P scope
+// ------------
+// The M3-002 ANSI parser + M4 fingerprint smokes exercise the tree
+// without needing a real event loop -- each test binary calls
+// Grid::grid_reset, Ansi::ansi_reset, Schema::schema_reset then
+// walks a `.rodata` fixture through Ansi::ansi_feed_bytes and
+// asserts `.bss` state. Main::pdxterm_main at Wave P provides an
+// honest skeleton so `manifest.pdxproj entry = Main::pdxterm_main`
+// resolves; the live libpdx-gfx + libpdx-event event loop lands at
+// R102.M2-001 / R102.M2-002 (issues #3, #4).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Main (PascalCase basename).
+//   - No `test`; only 1-push prologue for the nested reset calls.
+//   - r11 scratch.
+//   - Leaf-of-leaves after resets return.
+
+module Main = structure {
+
+  pub let pdxterm_main : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm Wave P main entry. Skeleton: reset the three modules (Grid, Ansi, Schema) then return 0. The live event loop lands at R102.M2-001 (KIND_SURFACE + libpdx-gfx wire) and R102.M3-001 (KIND_PTY spawn + /bin/shell attach). Wave P's fingerprint smokes exercise the modules directly via their public seams, so no run-loop body is reachable from this entry at this milestone. 1-push (r12) = 8 bytes; entry rsp%16 == 8 -> post-push rsp%16 == 0 for the three nested reset calls. Return 0 (SUCCESS).",
+      block: {
+        push r12;                                  // rsp%16: 8 -> 0
+        call grid_reset;
+        call ansi_reset;
+        call schema_reset;
+        xor rax, rax;
+        pop r12;
+        ret
+      }
+    }
+
+}

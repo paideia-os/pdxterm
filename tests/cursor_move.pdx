@@ -1,0 +1,112 @@
+// tests/cursor_move.pdx -- pdxterm R102.M4-003 (issue #10)
+// CursorMove module: pipe `ESC [ 5;10 H hello` into the ANSI parser,
+// assert "hello" lands at row 4 col 9..13 in the grid, cursor ends
+// at row 4 col 14.
+//
+// Fingerprint: "pdxterm cursor-move ok" (per r102-user-plan.md).
+//
+// The plan doc's §4.6 §R102.M4-003 line phrases the assert as "row 5
+// column 10" using the ANSI 1-based convention that CUP itself
+// consumes. Grid state is 0-based (Grid::grid_set_cursor already
+// normalises), so the assert lands at (4, 9) for the leading glyph
+// and (4, 13) for the trailing 'o'.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module CursorMove (PascalCase basename).
+//   - No `test`; every gate is cmp reg, imm.
+//   - No 2-op imul (grid offset computation delegated to
+//     grid_write_char which owns the shift-add discipline).
+//   - Byte reads via xor rax, rax; mov_b rax, [ptr].
+//   - Labels prefixed cm_.
+
+module CursorMove = structure {
+
+  // "\e[5;10Hhello" -- 12 bytes total. ESC(1) + [(1) + digits(1) +
+  // ;(1) + digits(2) + H(1) + hello(5) = 12.
+  pub let FIXTURE : [u8; 12] = "\x1B[5;10Hhello"
+
+  pub let mut _cm_pass : u64 = uninit @align(8)
+
+  pub let cursor_move_main : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm M4-003 (issue #10) cursor_move_main. Feed 12 bytes of `\\x1B[5;10Hhello`. Post-condition: cursor at (4, 14) after the 5 glyphs land at (4, 9..13); each of those cells has glyph == 'h'/'e'/'l'/'l'/'o'. 2-push (rbx = fingerprint accumulator, r12 = index) keeps rsp%16 == 0 at nested calls. Cell-glyph read via xor rax, rax; mov_b rax, [r10 + rax_offset] with the per-cell 4-byte stride open-coded as add. r10 caches &_grid_cells across the check loop. Labels prefixed cm_.",
+      block: {
+        push rbx;                                  // rsp%16: 8 -> 0
+        push r12;                                  // rsp%16: 0 -> 8
+        sub rsp, 8;                                // rsp%16: 8 -> 0
+
+        call grid_reset;
+        call ansi_reset;
+
+        // Feed the fixture.
+        lea rdi, [rip + FIXTURE];
+        mov rsi, 12;
+        call ansi_feed_bytes;
+
+        // Cursor should end at (4, 14).
+        xor rbx, rbx;                              // rbx = fingerprint
+        lea r11, [rip + cursor_row];
+        mov rax, [r11];
+        cmp rax, 4;
+        jne cm_check_glyphs;
+        lea r11, [rip + cursor_col];
+        mov rax, [r11];
+        cmp rax, 14;
+        jne cm_check_glyphs;
+        or rbx, 1;                                 // bit 0 = cursor-final
+
+      cm_check_glyphs:
+        // Check the five glyphs at (4, 9..13). Cell offset = (row*80 + col)*4.
+        // For row=4: 4*80 = 320. Offsets: (320+9)*4=1316, +4=1320, +4=1324, +4=1328, +4=1332.
+        lea r10, [rip + _grid_cells];
+
+        mov rax, 1316;
+        xor rcx, rcx;
+        mov_b rcx, [r10 + rax];
+        cmp rcx, 104;                              // 'h'
+        jne cm_check_e;
+        or rbx, 2;
+      cm_check_e:
+        mov rax, 1320;
+        xor rcx, rcx;
+        mov_b rcx, [r10 + rax];
+        cmp rcx, 101;                              // 'e'
+        jne cm_check_l1;
+        or rbx, 4;
+      cm_check_l1:
+        mov rax, 1324;
+        xor rcx, rcx;
+        mov_b rcx, [r10 + rax];
+        cmp rcx, 108;                              // 'l'
+        jne cm_check_l2;
+        or rbx, 8;
+      cm_check_l2:
+        mov rax, 1328;
+        xor rcx, rcx;
+        mov_b rcx, [r10 + rax];
+        cmp rcx, 108;                              // 'l'
+        jne cm_check_o;
+        or rbx, 16;
+      cm_check_o:
+        mov rax, 1332;
+        xor rcx, rcx;
+        mov_b rcx, [r10 + rax];
+        cmp rcx, 111;                              // 'o'
+        jne cm_done;
+        or rbx, 32;
+
+      cm_done:
+        // Full pass = all 6 bits set = 0x3F.
+        lea r11, [rip + _cm_pass];
+        mov [r11], rbx;
+        mov rax, rbx;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

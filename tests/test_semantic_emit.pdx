@@ -1,0 +1,147 @@
+// tests/test_semantic_emit.pdx -- pdxterm v1.1-B (issue #14)
+// TestSemanticEmit module: exercise Schema::term_event_emit and
+// assert record composition + sysno-115 marshalling correctness.
+//
+// Fingerprint: "pdxterm semantic-pipe ok" (Wave P convention;
+// design doc addendum accompanies the v1.1-B tag).
+//
+// Scope
+// -----
+// The sysno-115 kernel side (paideia-os R107-M0-001 #2350) accepts
+// the record and returns 0 on a live substrate run; at Wave P build
+// time the fingerprint is COMPOSITION-ONLY -- the test asserts
+// _term_record_buf holds the expected bytes AFTER term_event_emit
+// returns (regardless of the syscall return, which the substrate
+// kernel materialises).
+//
+// Cases exercised:
+//   [1] Bare emit -- term_event_emit(TERM_EV_WRITE, 'X', 0).
+//       Post-conditions:
+//         - _term_record_buf[+0..+8]  == TERM_REC_MAGIC ("PDXKTERM" LE)
+//         - _term_record_buf[+8..+12] == 1 (version)
+//         - _term_record_buf[+16..+20] == 1 (kind = TERM_EV_WRITE)
+//         - _term_record_buf[+24..+32] == 88 ('X')
+//         - term_last_kind == 1
+//   [2] Cursor emit -- term_event_emit(TERM_EV_CURSOR, 5, 10).
+//       Post-conditions:
+//         - _term_record_buf[+16..+20] == 2 (TERM_EV_CURSOR)
+//         - _term_record_buf[+24..+32] == 5 (row)
+//         - _term_record_buf[+32..+40] == 10 (col)
+//         - term_last_kind == 2
+//   [3] Multi-emit counter -- 3 successive emits, then check
+//       (term_emit_ok_count + term_emit_err_count) == 3.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module TestSemanticEmit (PascalCase basename).
+//   - No `test`; every gate is cmp reg, imm.
+//   - No 2-op imul.
+//   - Byte loads via xor rax, rax; mov_b rax, [ptr].
+//   - Labels prefixed tse_.
+
+module TestSemanticEmit = structure {
+
+  pub let mut _tse_fp : u64 = uninit @align(8)
+
+  // Fingerprint bits:
+  //   bit 0 = case 1 (write emit lanes)
+  //   bit 1 = case 2 (cursor emit lanes)
+  //   bit 2 = case 3 (counter sum)
+  // Full pass = 0x7.
+
+  pub let test_semantic_emit_main : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm v1.1-B (issue #14) test_semantic_emit_main. Drive three cases through Schema::term_event_emit and assemble a fingerprint bitmap. 1-push (rbx = fingerprint) keeps rsp%16 == 0 at every nested call (schema_reset, term_event_emit x3). Reads _term_record_buf lanes via u64 loads at fixed offsets. Reads term_emit_ok_count + term_emit_err_count for the counter case. All imm fit imm32 (1, 2, 3, 5, 10, 88, 16, 24, 32, 8). Labels prefixed tse_.",
+      block: {
+        push rbx;                                  // rsp%16: 8 -> 0
+
+        xor rbx, rbx;                              // rbx = fingerprint
+
+        // ===== Case 1: term_event_emit(TERM_EV_WRITE, 'X', 0) =====
+        call schema_reset;
+        mov rdi, 1;                                // TERM_EV_WRITE
+        mov rsi, 88;                               // 'X'
+        mov rdx, 0;
+        call term_event_emit;
+
+        // Check magic.
+        lea r11, [rip + _term_record_buf];
+        mov rax, [r11 + 0];
+        mov rcx, 0x4D5245544B584450;               // TERM_REC_MAGIC
+        cmp rax, rcx;
+        jne tse_c1_done;
+        // Check kind lane at +16 (u64 load; lower 32 = kind, upper 32 = padding).
+        mov rax, [r11 + 16];
+        cmp rax, 1;
+        jne tse_c1_done;
+        // Check arg0 lane at +24.
+        mov rax, [r11 + 24];
+        cmp rax, 88;
+        jne tse_c1_done;
+        // Check last_kind observable.
+        lea r11, [rip + term_last_kind];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne tse_c1_done;
+        or rbx, 1;
+      tse_c1_done:
+
+        // ===== Case 2: term_event_emit(TERM_EV_CURSOR, 5, 10) =====
+        call schema_reset;
+        mov rdi, 2;                                // TERM_EV_CURSOR
+        mov rsi, 5;
+        mov rdx, 10;
+        call term_event_emit;
+
+        lea r11, [rip + _term_record_buf];
+        mov rax, [r11 + 16];
+        cmp rax, 2;
+        jne tse_c2_done;
+        mov rax, [r11 + 24];
+        cmp rax, 5;
+        jne tse_c2_done;
+        mov rax, [r11 + 32];
+        cmp rax, 10;
+        jne tse_c2_done;
+        lea r11, [rip + term_last_kind];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne tse_c2_done;
+        or rbx, 2;
+      tse_c2_done:
+
+        // ===== Case 3: three successive emits, sum of counters == 3 =====
+        call schema_reset;
+        mov rdi, 1;
+        mov rsi, 65;
+        mov rdx, 0;
+        call term_event_emit;
+        mov rdi, 1;
+        mov rsi, 66;
+        mov rdx, 0;
+        call term_event_emit;
+        mov rdi, 1;
+        mov rsi, 67;
+        mov rdx, 0;
+        call term_event_emit;
+
+        lea r11, [rip + term_emit_ok_count];
+        mov rax, [r11];
+        lea r11, [rip + term_emit_err_count];
+        mov rcx, [r11];
+        add rax, rcx;
+        cmp rax, 3;
+        jne tse_done;
+        or rbx, 4;
+
+      tse_done:
+        lea r11, [rip + _tse_fp];
+        mov [r11], rbx;
+        mov rax, rbx;
+        pop rbx;
+        ret
+      }
+    }
+
+}

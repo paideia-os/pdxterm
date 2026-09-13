@@ -1,0 +1,230 @@
+// tests/test_ansi.pdx -- pdxterm R102.M3-002 (issue #7)
+// TestAnsi module: golden-fingerprint matrix for the CSI/SGR/cursor
+// state machine.
+//
+// Fingerprint: "pdxterm ansi ok" (per design/graphics/r102-user-plan.md).
+//
+// Cases exercised (each drives ansi_feed_bytes against a .rodata
+// fixture then asserts a `.bss` witness):
+//
+//   [1] Plain text "Hi" -> Grid::grid_writes == 2, cursor at (0, 2).
+//   [2] SGR reset       "\e[0m" -> cursor_fg == 7, cursor_bg == 0.
+//   [3] SGR fg 31 (red) "\e[31m" -> cursor_fg == 1.
+//   [4] SGR bg 44 (blu) "\e[44m" -> cursor_bg == 4.
+//   [5] CUP "\e[5;10H"  -> cursor_row == 4, cursor_col == 9 (0-based).
+//   [6] CUU "\e[3A"     -> cursor row moves up by 3 with clamp at 0.
+//   [7] CUF "\e[5C"     -> cursor col +5 within-bounds.
+//   [8] Unknown "\e[?"  -> ansi_unknown_seq_count bumped.
+//   [9] Newline "\n"    -> cursor_row +1, cursor_col = 0.
+//
+// The witness lane fingerprints are packed into a single u64 the
+// test writes to _ansi_test_fp; a QEMU-substrate consumer reads
+// _ansi_test_fp back to confirm every band landed.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module TestAnsi (PascalCase basename).
+//   - Every fixture is `pub let FIXTURE_i : [u8; N] = "..."` on one line
+//     (no multiline string concat -- pdx encoder pitfall).
+//   - Every call arity <= 3.
+//   - No `test`; every assert is `cmp reg, imm; jne fail_band_i`.
+//   - Labels prefixed ta_.
+
+module TestAnsi = structure {
+
+  // Fixtures. Every array size includes the exact byte count of the
+  // literal (NO NUL terminator on binary-shaped fixtures because the
+  // parser consumes by length, not by NUL-scan).
+  pub let FIXTURE_1 : [u8; 2] = "Hi"
+  pub let FIXTURE_2 : [u8; 4] = "\x1B[0m"
+  pub let FIXTURE_3 : [u8; 5] = "\x1B[31m"
+  pub let FIXTURE_4 : [u8; 5] = "\x1B[44m"
+  pub let FIXTURE_5 : [u8; 7] = "\x1B[5;10H"
+  pub let FIXTURE_6 : [u8; 4] = "\x1B[3A"
+  pub let FIXTURE_7 : [u8; 4] = "\x1B[5C"
+  pub let FIXTURE_8 : [u8; 3] = "\x1B[?"
+  pub let FIXTURE_9 : [u8; 1] = "\n"
+
+  pub let mut _ansi_test_fp : u64 = uninit @align(8)
+
+  // Fingerprint lane assignments (bit-per-band):
+  //   bit 0 = case 1 (plain text) passed
+  //   bit 1 = case 2 (SGR reset)
+  //   bit 2 = case 3 (SGR fg 31)
+  //   bit 3 = case 4 (SGR bg 44)
+  //   bit 4 = case 5 (CUP)
+  //   bit 5 = case 6 (CUU)
+  //   bit 6 = case 7 (CUF)
+  //   bit 7 = case 8 (unknown swallow)
+  //   bit 8 = case 9 (newline)
+  // On success every low 9 bits are set (fingerprint value 0x1FF).
+
+  pub let test_ansi_main : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm M3-002 test_ansi_main. Drive the ANSI parser through nine fixtures and assemble a bitmap fingerprint at _ansi_test_fp. 3-push prologue (rbx = fp accumulator, r12, r13) keeps rsp%16 == 0 at every nested call (grid_reset, ansi_reset, ansi_feed_bytes, then a set of accessor reads). rbx accumulates the fingerprint bits so a partial pass surfaces which case failed. Every fixture is a fixed-length rodata array; ansi_feed_bytes takes (ptr, len) and the len is a small imm32. All cmp imm fit imm32 (2, 4, 7, 9, 0, 1, 4, 5). Labels prefixed ta_.",
+      block: {
+        push rbx;                                  // rsp%16: 8 -> 0
+        push r12;                                  // rsp%16: 0 -> 8
+        push r13;                                  // rsp%16: 8 -> 0
+
+        xor rbx, rbx;                              // rbx = fingerprint accumulator
+
+        // ===== Case 1: plain text "Hi" =====
+        call grid_reset;
+        call ansi_reset;
+        lea rdi, [rip + FIXTURE_1];
+        mov rsi, 2;
+        call ansi_feed_bytes;
+        lea r11, [rip + grid_writes];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne ta_case1_done;
+        lea r11, [rip + cursor_col];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne ta_case1_done;
+        or rbx, 1;                                 // bit 0
+      ta_case1_done:
+
+        // ===== Case 2: SGR reset =====
+        call grid_reset;
+        call ansi_reset;
+        // Seed cursor_fg to a non-default so reset is observable.
+        mov rax, 3;
+        lea r11, [rip + cursor_fg];               mov [r11], rax;
+        mov rax, 5;
+        lea r11, [rip + cursor_bg];               mov [r11], rax;
+        lea rdi, [rip + FIXTURE_2];
+        mov rsi, 4;
+        call ansi_feed_bytes;
+        lea r11, [rip + cursor_fg];
+        mov rax, [r11];
+        cmp rax, 7;
+        jne ta_case2_done;
+        lea r11, [rip + cursor_bg];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne ta_case2_done;
+        or rbx, 2;                                 // bit 1
+      ta_case2_done:
+
+        // ===== Case 3: SGR fg 31 =====
+        call grid_reset;
+        call ansi_reset;
+        lea rdi, [rip + FIXTURE_3];
+        mov rsi, 5;
+        call ansi_feed_bytes;
+        lea r11, [rip + cursor_fg];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne ta_case3_done;
+        or rbx, 4;                                 // bit 2
+      ta_case3_done:
+
+        // ===== Case 4: SGR bg 44 =====
+        call grid_reset;
+        call ansi_reset;
+        lea rdi, [rip + FIXTURE_4];
+        mov rsi, 5;
+        call ansi_feed_bytes;
+        lea r11, [rip + cursor_bg];
+        mov rax, [r11];
+        cmp rax, 4;
+        jne ta_case4_done;
+        or rbx, 8;                                 // bit 3
+      ta_case4_done:
+
+        // ===== Case 5: CUP "\e[5;10H" -> (4, 9) =====
+        call grid_reset;
+        call ansi_reset;
+        lea rdi, [rip + FIXTURE_5];
+        mov rsi, 7;
+        call ansi_feed_bytes;
+        lea r11, [rip + cursor_row];
+        mov rax, [r11];
+        cmp rax, 4;
+        jne ta_case5_done;
+        lea r11, [rip + cursor_col];
+        mov rax, [r11];
+        cmp rax, 9;
+        jne ta_case5_done;
+        mov rax, 16;                               // bit 4
+        or rbx, rax;
+      ta_case5_done:
+
+        // ===== Case 6: CUU "\e[3A" from row 5 -> row 2 =====
+        call grid_reset;
+        call ansi_reset;
+        mov rax, 5;
+        lea r11, [rip + cursor_row];               mov [r11], rax;
+        lea rdi, [rip + FIXTURE_6];
+        mov rsi, 4;
+        call ansi_feed_bytes;
+        lea r11, [rip + cursor_row];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne ta_case6_done;
+        mov rax, 32;                               // bit 5
+        or rbx, rax;
+      ta_case6_done:
+
+        // ===== Case 7: CUF "\e[5C" from col 0 -> col 5 =====
+        call grid_reset;
+        call ansi_reset;
+        lea rdi, [rip + FIXTURE_7];
+        mov rsi, 4;
+        call ansi_feed_bytes;
+        lea r11, [rip + cursor_col];
+        mov rax, [r11];
+        cmp rax, 5;
+        jne ta_case7_done;
+        mov rax, 64;                               // bit 6
+        or rbx, rax;
+      ta_case7_done:
+
+        // ===== Case 8: unknown swallow "\e[?" =====
+        call grid_reset;
+        call ansi_reset;
+        lea rdi, [rip + FIXTURE_8];
+        mov rsi, 3;
+        call ansi_feed_bytes;
+        lea r11, [rip + ansi_unknown_seq_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        je ta_case8_done;
+        mov rax, 128;                              // bit 7
+        or rbx, rax;
+      ta_case8_done:
+
+        // ===== Case 9: newline =====
+        call grid_reset;
+        call ansi_reset;
+        lea rdi, [rip + FIXTURE_9];
+        mov rsi, 1;
+        call ansi_feed_bytes;
+        lea r11, [rip + cursor_row];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne ta_case9_done;
+        lea r11, [rip + cursor_col];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne ta_case9_done;
+        mov rax, 256;                              // bit 8
+        or rbx, rax;
+      ta_case9_done:
+
+        // Land the fingerprint. Full-pass value is 0x1FF (bits 0..8).
+        lea r11, [rip + _ansi_test_fp];
+        mov [r11], rbx;
+        mov rax, rbx;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

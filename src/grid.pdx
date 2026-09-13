@@ -1,0 +1,232 @@
+// src/grid.pdx -- pdxterm Wave P (M2-001 substrate skeleton)
+// Grid module: 80x25 text grid + cursor state.
+//
+// Scope
+// -----
+// Wave P lands the encoder-half skeleton of the terminal cell grid
+// so that the M3-002 ANSI parser (src/ansi.pdx) and the M4 golden-
+// fingerprint smokes have a stable target surface to write into.
+// Live libpdx-gfx surface commit lives at R102.M2-001 (issue #3);
+// this skeleton exposes ONLY the .bss cell array + cursor state +
+// two write primitives (`grid_write_char`, `grid_set_cursor`) the
+// parser and the smokes call.
+//
+// Cell layout: 4 bytes per cell (glyph:u8, fg:u8, bg:u8, flags:u8).
+// Grid is 80 * 25 = 2000 cells = 8000 bytes. Cursor state is four
+// u64 slots (row, col, fg, bg) so the ANSI parser can update them
+// without byte-load-and-mask arithmetic.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Grid (PascalCase basename).
+//   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+//   - cmp imm <= 0x7FFFFFFF (all imm here are the grid dimensions
+//     80, 25, and 4-byte cell stride constants).
+//   - r11 is scratch (used for every rip-relative lea).
+//   - Byte writes never require a byte read first; the parser writes
+//     glyphs top-down so no read-modify-write is needed.
+//   - Every function is a leaf (no push/pop parity).
+//
+// Wire discipline: `grid_write_char` and `grid_set_cursor` are the
+// two seams the ANSI parser needs. The smokes read the .bss grid
+// state back via a golden-fingerprint compare rather than a live
+// framebuffer diff.
+
+module Grid = structure {
+
+  // Grid dimensions. Frozen per design/graphics/r102-user-plan.md
+  // §2.6 (80 cols, 25 rows -- the standard VT100 shape).
+  pub let GRID_COLS : u64 = 80
+  pub let GRID_ROWS : u64 = 25
+  pub let CELL_BYTES: u64 = 4
+
+  // Default cursor palette indices (SGR 39/49 posture): fg=7 (white),
+  // bg=0 (black). Matches the 8-color palette the ANSI parser decodes
+  // at SGR reset (\e[0m) or at fresh-boot cursor state.
+  pub let DEFAULT_FG: u64 = 7
+  pub let DEFAULT_BG: u64 = 0
+
+  // .bss cell grid: 80 * 25 * 4 = 8000 bytes. Interpreted per-cell
+  // as (glyph:u8 @+0, fg:u8 @+1, bg:u8 @+2, flags:u8 @+3). The
+  // parser's write path uses stride multiplication (row * 80 + col)
+  // * 4 = byte offset. Every arithmetic factor fits imm32.
+  pub let mut _grid_cells : [u8; 8000] = uninit @align(8)
+
+  // .bss cursor state: four u64 slots (row, col, fg, bg). The ANSI
+  // parser reads and writes these directly; smokes assert against
+  // them for cursor-move correctness.
+  pub let mut cursor_row : u64 = uninit @align(8)
+  pub let mut cursor_col : u64 = uninit @align(8)
+  pub let mut cursor_fg  : u64 = uninit @align(8)
+  pub let mut cursor_bg  : u64 = uninit @align(8)
+
+  // .bss observability: number of grid_write_char calls that landed
+  // (clamped or in-bounds) since the last reset. Smokes read this to
+  // confirm the parser stepped through the fixture stream.
+  pub let mut grid_writes : u64 = uninit @align(8)
+
+  // grid_reset() -- zero cell array, home cursor, reset palette.
+  //
+  // Called at every M4 smoke fixture entry so tests run against a
+  // known-clean grid. Zero-fill is a bounded 8000-byte loop; small
+  // enough to inline as a 1000-qword rep-store (paideia-as does not
+  // emit rep instructions at this milestone, so we open-code an
+  // 8-byte-at-a-time loop bounded by a cmp/jb pair). Cursor lands
+  // at (0, 0) with default palette.
+  pub let grid_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-001 grid_reset. Zero the 8000-byte cell array in 1000 u64-wide stores; home cursor to (0,0) with fg=7/bg=0 default palette; zero the grid_writes observability slot. Leaf; r11 scratch for rip-relative lea; rcx as loop counter (SysV caller-save). No `test`; loop uses `cmp rcx, 1000; jb`. All immediates (1000, 8, 7, 0) fit imm32. cursor_row/cursor_col/cursor_fg/cursor_bg touched via rip-relative store. No push/pop parity.",
+      block: {
+        // Zero-fill the cell array (1000 u64 stores).
+        lea r11, [rip + _grid_cells];
+        xor rcx, rcx;
+        xor rax, rax;
+      grid_reset_loop:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 1000;
+        jb grid_reset_loop;
+
+        // Home cursor + default palette.
+        xor rax, rax;
+        lea r11, [rip + cursor_row];    mov [r11], rax;
+        lea r11, [rip + cursor_col];    mov [r11], rax;
+        lea r11, [rip + cursor_bg];     mov [r11], rax;
+        lea r11, [rip + grid_writes];   mov [r11], rax;
+        mov rax, 7;
+        lea r11, [rip + cursor_fg];     mov [r11], rax;
+        ret
+      }
+    }
+
+  // grid_set_cursor(row, col) -> u64
+  //   Clamp row to [0, GRID_ROWS-1] and col to [0, GRID_COLS-1] then
+  //   store into cursor_row / cursor_col. Returns 0 on in-bounds
+  //   store, 1 on clamp (either coord was out of range).
+  //   The ANSI parser's CSI-H handler is the sole caller at Wave P.
+  pub let grid_set_cursor : (u64, u64) -> u64 !{mem} @{} =
+    fn (row: u64) (col: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-001 grid_set_cursor. Clamp (row, col) into grid bounds then store. rax reserved as return-value scratch (0 = in-bounds, 1 = clamp fired). r11 scratch for the two .bss stores. No `test`; two `cmp reg, imm` clamp gates against GRID_ROWS/GRID_COLS. All imm fit imm32 (25, 80). Leaf function; SYSCALL never issued. rdx used as the clamp-marker accumulator (SysV caller-save).",
+      block: {
+        xor rdx, rdx;                    // clamp_fired = 0
+        // Clamp row.
+        cmp rdi, 25;
+        jb grid_set_cursor_row_ok;
+        mov rdi, 24;                     // GRID_ROWS - 1
+        mov rdx, 1;
+      grid_set_cursor_row_ok:
+        // Clamp col.
+        cmp rsi, 80;
+        jb grid_set_cursor_col_ok;
+        mov rsi, 79;                     // GRID_COLS - 1
+        mov rdx, 1;
+      grid_set_cursor_col_ok:
+        lea r11, [rip + cursor_row];     mov [r11], rdi;
+        lea r11, [rip + cursor_col];     mov [r11], rsi;
+        mov rax, rdx;
+        ret
+      }
+    }
+
+  // grid_write_char(glyph) -> u64
+  //   Write `glyph` (low byte of rdi) at the current cursor cell,
+  //   using the current cursor_fg / cursor_bg palette. Advance cursor
+  //   one column; wrap to next row on col == GRID_COLS. Returns 0 on
+  //   success, 1 if the cursor rolled off the bottom (row overflow;
+  //   the write still lands at (GRID_ROWS-1, GRID_COLS-1) as a
+  //   clamped emit).
+  //
+  // Byte offset into _grid_cells: (row * 80 + col) * 4. The multiply
+  // by 80 avoids `imul r, imm` (pdx encoder pitfalls: 2-op imul
+  // forbidden); we compute `row * 80 = row * 64 + row * 16 =
+  // (row << 6) + (row << 4)` via shl + add. The final `* 4` is a
+  // simple shl. Every immediate fits imm32.
+  pub let grid_write_char : (u64) -> u64 !{mem} @{} =
+    fn (glyph: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxterm M2-001 grid_write_char. Compose byte offset into _grid_cells via shift-add (no 2-op imul, per pdx encoder pitfalls). rbx preserves glyph across the load-store shape (caller passes glyph in rdi; the address computation trashes rax/rcx/rdx). r12 caches the &_grid_cells base after cursor load so the offset add lands on a live pointer. Returns 0 on in-bounds land, 1 if the advance wrapped past the bottom row (write clamped to bottom-right). r11 scratch for cursor loads / stores. All imm fit imm32 (4, 6, 80, 25, 24, 79). 2-push prologue (rbx, r12) keeps rsp%16==0 at any nested call (none at this shape; kept for uniformity with siblings). No `test`; every gate is `cmp reg, imm`.",
+      block: {
+        push rbx;                        // rsp%16: 8 -> 0
+        push r12;                        // rsp%16: 0 -> 8
+        sub rsp, 8;                      // rsp%16: 8 -> 0
+
+        mov rbx, rdi;                    // rbx = glyph (low byte)
+
+        // Load cursor state.
+        lea r11, [rip + cursor_row];
+        mov rax, [r11];                  // rax = row
+        lea r11, [rip + cursor_col];
+        mov rcx, [r11];                  // rcx = col
+
+        // Compose byte offset: (row * 80 + col) * 4.
+        // row * 80 = (row << 6) + (row << 4).
+        mov rdx, rax;
+        shl rdx, 6;                      // rdx = row * 64
+        shl rax, 4;                      // rax = row * 16
+        add rax, rdx;                    // rax = row * 80
+        add rax, rcx;                    // rax = row * 80 + col
+        shl rax, 2;                      // rax = (row * 80 + col) * 4
+
+        // Store glyph, fg, bg, flags into the cell. Compose the cell
+        // base pointer once into r12, then advance by 1 across the
+        // four sized-byte stores per paideia-as encoder discipline
+        // (`mov_b [ptr], reg` with a plain base -- mkfs-pdxb precedent).
+        lea r12, [rip + _grid_cells];
+        add r12, rax;                    // r12 = &cell (base for four byte stores)
+        mov_b [r12], rbx;                // glyph (low byte of rbx)
+        add r12, 1;
+        lea r11, [rip + cursor_fg];
+        mov rdx, [r11];
+        mov_b [r12], rdx;
+        add r12, 1;
+        lea r11, [rip + cursor_bg];
+        mov rdx, [r11];
+        mov_b [r12], rdx;
+        add r12, 1;
+        xor rdx, rdx;
+        mov_b [r12], rdx;                // flags = 0 at Wave P
+
+        // Bump grid_writes observability counter.
+        lea r11, [rip + grid_writes];
+        mov rdx, [r11];
+        add rdx, 1;
+        mov [r11], rdx;
+
+        // Advance cursor: col + 1; on col == 80 wrap to next row.
+        lea r11, [rip + cursor_col];
+        mov rcx, [r11];
+        add rcx, 1;
+        cmp rcx, 80;
+        jb grid_write_char_advance_ok;
+        // Wrap.
+        xor rcx, rcx;
+        lea r11, [rip + cursor_row];
+        mov rax, [r11];
+        add rax, 1;
+        cmp rax, 25;
+        jb grid_write_char_row_ok;
+        // Row overflow: clamp to last row and set return flag.
+        mov rax, 24;
+        lea r11, [rip + cursor_row];    mov [r11], rax;
+        lea r11, [rip + cursor_col];    mov [r11], rcx;
+        mov rax, 1;
+        jmp grid_write_char_done;
+      grid_write_char_row_ok:
+        lea r11, [rip + cursor_row];    mov [r11], rax;
+        lea r11, [rip + cursor_col];    mov [r11], rcx;
+        xor rax, rax;
+        jmp grid_write_char_done;
+      grid_write_char_advance_ok:
+        lea r11, [rip + cursor_col];    mov [r11], rcx;
+        xor rax, rax;
+      grid_write_char_done:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

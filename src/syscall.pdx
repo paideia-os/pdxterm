@@ -1,0 +1,53 @@
+// src/syscall.pdx -- pdxterm Wave P (v1.1-B, issue #14)
+// Syscall module: sysno wrapper set pdxterm needs at Wave P.
+//
+// Scope
+// -----
+// Wave P (M3-002 ANSI parser + three M4 smokes + v1.1-B semantic-pipe
+// emission) introduces the FIRST syscall in the pdxterm tree: SC+ ID
+// 115 (`sys_semantic_send`). The M1/M2 substrate skeletons are pure
+// text-transducer state, so no earlier sysno is reachable from the
+// live code path at this milestone.
+//
+// SC+ ID 115 provenance: R107-M0-001 (paideia-os #2350). The kernel
+// body copies `record_len` bytes from `record_ptr` into the next slot
+// of a fixed 16-slot global `_semantic_ring`; overwrite-oldest ring
+// policy. -EINVAL on `record_len == 0` or `record_len > 240`, -EFAULT
+// on bad `record_ptr`. Capability set intentionally empty (no fs,
+// cap, sched or signal effect).
+//
+// Calling convention (SysV -> SYSCALL): arity 3, no arg shuffle
+// (rdi/rsi/rdx pass through). Leaf; syscall clobbers rcx/r11 (both
+// SysV caller-save, harmless).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Syscall (PascalCase basename).
+//   - No `test rN, rN` (leaf body issues no comparisons).
+//   - No large immediates (sysno 115 fits imm32).
+//   - r11 untouched by the wrapper body (paideia-as reserved scratch;
+//     the SYSCALL instruction itself clobbers it per amd64 semantics,
+//     which the caller already treats as caller-save).
+//   - No byte reads.
+//   - Leaf function (no push/pop parity).
+
+module Syscall = structure {
+
+  // SC+ ID 115 -- see paideia-os design/user/syscall-table.md.
+  pub let SYS_SEMANTIC_SEND : u64 = 115
+
+  // sys_semantic_send(schema, record_ptr, record_len) -> u64
+  //   0 on success, negative errno on failure.
+  //   SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle).
+  pub let sys_semantic_send : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm v1.1-B (issue #14): SC+ ID 115 wrapper. Arity 3 -- SysV rdi/rsi/rdx pass through unchanged to SYSCALL rdi/rsi/rdx (no arg3 shuffle). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_semantic_send.pdx (landed R107-M0-001 #2350). Effect/capability tail matches the monorepo canonical shim src/user/syscall_shim.pdx sys_semantic_send byte-for-byte: !{mem, sysreg} for SYSCALL + the kernel-side record-body copy into _semantic_ring; capabilities:{} because the sysno operates over a fixed global ring with no per-caller cap check. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Sole pdxterm caller at Wave P: Schema::term_event_emit (src/schema.pdx). Labels: none (linear body).",
+      block: {
+        mov rax, 115;
+        syscall;
+        ret
+      }
+    }
+
+}

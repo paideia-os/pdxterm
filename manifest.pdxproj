@@ -1,0 +1,44 @@
+# pdxterm -- paideia-as build manifest
+#
+# Wave: R102  Milestone: M3 (ANSI parser) + M4 (three smokes) + v1.1-B (semantic pipe)
+# Doc:  design/graphics/r102-user-plan.md §4.6 in the paideia-os repo.
+#
+# Wave P landing shape: M1/M2 substrate scaffolded as encoder-only
+# skeletons so the M3/M4 smoke bodies compile against a stable
+# module surface. Live libpdx-gfx / libpdx-font / libpdx-event
+# runtime attach lives at R102.M2-001 (issue #3) and does NOT gate
+# the ANSI parser, the golden-fingerprint smokes, or the sysno-115
+# semantic-pipe emit; those three ride entirely on `.rodata`-fixture
+# input and `.bss`-observable output.
+
+name        = pdxterm
+version     = 1.1.0
+kind        = tool
+entry       = Main::pdxterm_main
+output      = build-out/pdxterm
+caps_decl   = caps.decl
+
+sources:
+  - src/tool_ident.pdx           # Wave F: PDX_TOOL_NAME/PDX_TOOL_VERSION externs
+  - src/syscall.pdx              # sys_semantic_send (SC+ ID 115) wrapper (v1.1-B)
+  - src/grid.pdx                 # 80x25 grid + cursor state (M2-001 skeleton)
+  - src/ansi.pdx                 # M3-002 (#7): ANSI CSI/SGR/cursor-move state machine
+  - src/schema.pdx               # v1.1-B (#14): TermEventRecord@0.1 emit
+  - src/main.pdx                 # pdxterm_main entry
+
+deps: []
+
+tests:
+  - tests/test_ansi.pdx                    # M3-002 (#7): parser fingerprint matrix
+  - tests/render_identity.pdx              # M4-001 (#8): 80x25 grid seed + digest fingerprint
+  - tests/cursor_move.pdx                  # M4-003 (#10): ESC[5;10H hello fingerprint
+  - tests/shell_echo_roundtrip.pdx         # M4-002 (#9): honest-blockage witness
+  - tests/test_semantic_emit.pdx           # v1.1-B (#14): sysno-115 marshal fingerprint
+
+compliance:
+  - module-basename-pascal
+  - no-test-mnemonic
+  - cmp-imm32-only
+  - r11-scratch
+  - byte-load-zero-then-mov_b
+  - sysv-push-pop-parity
