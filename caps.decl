@@ -25,6 +25,15 @@
 # actual surface-mint syscall wrapper is not yet linked (blocking on
 # libpdx-gfx.M2-001, same dependency STATUS.md already tracks for
 # issue #3), so window_request_surface is an honest-blockage stub.
+#
+# Wave BBB (M3-001, issue #6) exercises the KIND_PTY(read, write,
+# mint) requirement already declared below via src/pty_wire.pdx's
+# pty_spawn_shell, dispatched through the generic sys_cap_invoke
+# (SC+ ID 4). No kernel-side KIND_PTY dispatch body exists yet (no
+# kind_pty.pdx anywhere in the kernel tree) -- see src/pty_wire.pdx's
+# header for the full kernel-gap disclosure. Declaring the requirement
+# here now means no caps.decl edit is needed once R101 lands the real
+# dispatch body.
 
 requires:
 - KIND_USER(read)

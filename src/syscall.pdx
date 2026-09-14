@@ -33,6 +33,30 @@
 
 module Syscall = structure {
 
+  // SC+ ID 4 -- sys_cap_invoke(slot, op_arg) -> result. Generic cap
+  // operation dispatch, R13 legacy still frozen in the dispatcher; see
+  // src/user/syscall_shim.pdx row 5 in the paideia-os monorepo. Added
+  // at Wave OO (issue #6) as pdxterm's sole cap-invoke call site --
+  // src/pty_wire.pdx dispatches KIND_PTY's proposed spawn op through
+  // it (see that file's header for the documented kernel-gap
+  // disclosure: no kind_pty.pdx dispatch body exists yet).
+  pub let SYS_CAP_INVOKE : u64 = 4
+
+  // sys_cap_invoke(slot, op_arg) -> u64
+  //   0 on success, negative errno on failure (e.g. -EBADF on a slot
+  //   with no live cap). SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle,
+  //   arity 2 < 4).
+  pub let sys_cap_invoke : (u64, u64) -> u64 !{sysreg} @{cap} =
+    fn (slot: u64) (op_arg: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "pdxterm M3-001 (issue #6) sys_cap_invoke wrapper. Arity 2 -- SysV rdi/rsi pass through unchanged to SYSCALL rdi/rsi. Mirrors the monorepo canonical shim src/user/syscall_shim.pdx sys_cap_invoke byte-for-byte (SC+ ID 4, R13 legacy preserved): effects !{sysreg}, capabilities {cap}. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Sole pdxterm caller at Wave OO: PtyWire::pty_spawn_shell (src/pty_wire.pdx). Labels: none (linear body).",
+      block: {
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
   // SC+ ID 115 -- see paideia-os design/user/syscall-table.md.
   pub let SYS_SEMANTIC_SEND : u64 = 115
 

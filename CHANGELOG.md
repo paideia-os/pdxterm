@@ -1,5 +1,59 @@
 # pdxterm CHANGELOG
 
+## v1.3.0 -- 2026-09-13 (Wave BBB: 4-issue tail, issues #6/#11/#12/#15)
+
+Landing shape: closes the last four open issues in the tracker.
+#6 and #11 are code landings; #12 and #15 are retroactive
+documentation closes (the repo has been functionally past a 1.0.0
+surface since v1.1.0, but never formally tagged either milestone).
+
+- `src/pty_wire.pdx` (new, #6) -- `Module PtyWire`: R102.M3-001 real
+  KIND_PTY spawn + shell attach. `pty_spawn_shell` dispatches the
+  proposed KIND_PTY spawn op through the already-landed generic
+  `sys_cap_invoke` (SC+ ID 4) against a reserved candidate cap slot.
+  **Disclosed kernel gap:** no `kind_pty.pdx` dispatch body exists
+  anywhere in the kernel tree yet, so this call is expected to fail
+  closed (negative errno) until R101 lands real KIND_PTY substrate;
+  the function records the raw result plus a blockage marker
+  (`PTY_BLOCKED_KERNEL_GAP = 0x8003`) rather than fabricating live
+  fds, per the R102 plan's own §7.3 escalation posture. Two stable
+  attach seams are wired now for a future live fd to drop into
+  unchanged: `pty_drain_keyboard_to_master` (reads
+  `Keyboard::_pty_out_head`, the existing keystroke-ring occupancy)
+  and `pty_feed_slave_bytes` (forwards straight into
+  `Ansi::ansi_feed_bytes`, the live grid-render path three CLOSED
+  fingerprint tests already exercise). argv[0]="sh" staged as a
+  `.rodata` fixture (`PROC_ARGV0_SH`) for the eventual `sys_execve` +
+  `sys_dup2` spawn (both already-landed kernel sysnos) once a slave fd
+  exists.
+- `src/syscall.pdx` -- adds `sys_cap_invoke` (SC+ ID 4, R13 legacy)
+  wrapper, mirroring `src/user/syscall_shim.pdx` row 5 byte-for-byte;
+  pdxterm's sole caller is `PtyWire::pty_spawn_shell`.
+- `caps.decl` -- notes that Wave BBB exercises the already-declared
+  `KIND_PTY(read, write, mint)` requirement via `pty_spawn_shell`; no
+  new capability kind added.
+- `tests/scrollback_smoke.pdx` (new, #11) -- `Module ScrollbackSmoke`:
+  pushes 300 rows into `Scrollback`'s 256-slot ring and asserts (a)
+  `head` wraps to 0 at exactly 256 pushes, (b) `head` ends at 300 mod
+  256 = 44, (c) slot 0 (oldest row) is overwritten by push index 256,
+  proving the overwrite-oldest policy. Diverges from the plan doc's
+  PageUp/PageDown scroll-view scope by design -- no scroll-view API
+  exists anywhere in this tree yet, so this smoke targets the
+  primitive `Scrollback::sb_push_row` actually provides (see the
+  file's header for the full rationale); a view-level smoke is a
+  follow-up once Grid/Scrollback grow a viewport-offset API.
+- Retroactive milestone closes: #12 (R102.M5-001, "signed 1.0.0
+  release") and #15 (v1.1-C release closer) are closed as
+  documentation-only. `manifest.pdxsig`'s dual-sign note now records
+  that ed25519/ML-DSA signing tooling is unbuilt org-wide, so the two
+  signature slots stay `unsigned` placeholders rather than a
+  fabricated signature; `README.md` gains a "Release status" section
+  cross-referencing this history.
+- `manifest.pdxproj` / `manifest.pdxsig` -- version 1.2.0 -> 1.3.0;
+  sources list gains `src/pty_wire.pdx`; tests list gains
+  `tests/scrollback_smoke.pdx`.
+- `src/tool_ident.pdx` -- `PDX_TOOL_VERSION` bumped to `1.3.0\0`.
+
 ## v1.2.0 -- 2026-09-13 (Wave OO: M1/M2 cohort, issues #1-#5)
 
 Landing shape: fills in the M1/M2 surface Wave P's skeletons

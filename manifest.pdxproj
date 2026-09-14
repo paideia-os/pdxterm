@@ -17,9 +17,17 @@
 # upstream blockage (libpdx-gfx surface mint, the process argv ABI,
 # or "don't touch a CLOSED milestone's state machine without a build
 # pass available").
+#
+# Wave BBB (issues #6, #11, #12, #15) adds src/pty_wire.pdx (M3-001,
+# #6: KIND_PTY spawn request via sys_cap_invoke, honest kernel-gap
+# disclosure -- see that file's header) plus its sys_cap_invoke
+# wrapper in src/syscall.pdx, and tests/scrollback_smoke.pdx (M4-004,
+# #11: 300-row push smoke against Scrollback's 256-slot ring). Issues
+# #12 (M5-001 signed 1.0.0 release) and #15 (v1.1-C release closer)
+# are retroactive documentation closes -- see CHANGELOG.md.
 
 name        = pdxterm
-version     = 1.2.0
+version     = 1.3.0
 kind        = tool
 entry       = Main::pdxterm_main
 output      = build-out/pdxterm
@@ -27,11 +35,12 @@ caps_decl   = caps.decl
 
 sources:
   - src/tool_ident.pdx           # Wave F: PDX_TOOL_NAME/PDX_TOOL_VERSION externs
-  - src/syscall.pdx              # sys_semantic_send (SC+ ID 115) wrapper (v1.1-B)
+  - src/syscall.pdx              # sys_semantic_send (SC+ ID 115) + sys_cap_invoke (SC+ ID 4, #6) wrappers
   - src/grid.pdx                 # 80x25 cursor grid (M3 skeleton) + M2-001 (#3) put_char/clear/render_all cell planes
   - src/window.pdx               # M1-002 (#2): argv rows/cols + KIND_SURFACE request stub
   - src/keyboard.pdx             # M2-002 (#4): keysym->byte LUT + stub-pty ring
   - src/scrollback.pdx           # M2-003 (#5): 256-row scrollback ring
+  - src/pty_wire.pdx             # M3-001 (#6): KIND_PTY spawn request + master/slave attach seams
   - src/ansi.pdx                 # M3-002 (#7): ANSI CSI/SGR/cursor-move state machine
   - src/schema.pdx               # v1.1-B (#14): TermEventRecord@0.1 emit
   - src/main.pdx                 # pdxterm_main entry
@@ -43,6 +52,7 @@ tests:
   - tests/render_identity.pdx              # M4-001 (#8): 80x25 grid seed + digest fingerprint
   - tests/cursor_move.pdx                  # M4-003 (#10): ESC[5;10H hello fingerprint
   - tests/shell_echo_roundtrip.pdx         # M4-002 (#9): honest-blockage witness
+  - tests/scrollback_smoke.pdx             # M4-004 (#11): 300-row push vs 256-slot ring fingerprint
   - tests/test_semantic_emit.pdx           # v1.1-B (#14): sysno-115 marshal fingerprint
 
 compliance:

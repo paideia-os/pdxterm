@@ -28,6 +28,21 @@ Per the plan, this repo lands across five milestones:
 
 Every issue is filed against one of these five milestones; see the Issues tab.
 
+## Release status
+
+Current version: **v1.3.0**. M1-M4 have landed (issues #1-#11, #14);
+M5 (issue #12, "signed 1.0.0 release") and the earlier v1.1-C release
+closer (issue #15) are closed as *retroactive documentation
+milestones* -- the repo passed a 1.0.0-equivalent surface back at
+v1.1.0 without a formal tag/CHANGELOG closure, so #15 and #12 record
+that history rather than gating a not-yet-reached 1.0.0. The dual-sign
+manifest (`manifest.pdxsig`) stays an unsigned source-form draft:
+ed25519 + ML-DSA signing tooling has not been built anywhere in the
+org yet, so no real signature can be produced. See `CHANGELOG.md` for
+the per-wave detail and `src/pty_wire.pdx` for the one open kernel-side
+gap (KIND_PTY has no dispatch body in the kernel yet) blocking a fully
+live M3 substrate.
+
 ## Scaffolding
 
 No code lands with this repo scaffold — scaffolding lives in the M1

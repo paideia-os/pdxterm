@@ -7,19 +7,35 @@
 # #12, "signed 1.0.0 release") dual-signs. It mirrors manifest.pdxproj
 # (the paideia-as build manifest already in this tree) plus the two
 # signature slots the M5 release process fills in; it carries no
-# signature bytes yet, since pdxterm has not reached a 1.0.0 release
-# candidate. Re-derive this file from manifest.pdxproj whenever the
+# signature bytes yet -- pdxterm has landed M1-M4 (all of #1-#11,
+# #14) plus the M3-001 KIND_PTY spawn stub (#6, honest kernel-gap
+# disclosure, see src/pty_wire.pdx) but the actual ed25519/ML-DSA key
+# material and signing tool have not been wired into any repo in this
+# org yet. Re-derive this file from manifest.pdxproj whenever the
 # sources/deps/caps_decl lists there change, keeping the two in sync
 # until the M5 tooling generates manifest.pdxsig mechanically from
 # manifest.pdxproj + a signing key pair.
 #
+# Retroactive M5 close (issue #12, Wave BBB): the repo has been at
+# version >= 1.1.0 since Wave P and is now at 1.3.0 -- functionally
+# well past a "1.0.0" candidate. Issue #12 is closed as a
+# DOCUMENTATION-ONLY retroactive M5 milestone marker: this file's
+# sources/version stay in lockstep with manifest.pdxproj, and the
+# CHANGELOG/README record the milestone's closure, but the two
+# signature slots below remain `unsigned` placeholders -- dual-sign
+# tooling (the actual ed25519 + ML-DSA key generation and signing
+# pass) is still unbuilt org-wide, so signing this file would
+# fabricate a signature that does not verify against any real key.
+# The mechanical signing pass is left as the follow-up once that
+# tooling exists.
+#
 # Dual-sign scheme: classical (ed25519) + post-quantum (ML-DSA), per
 # `project_license_and_extensions` / paideia-os PQ-signing discipline
-# (design/paideia-as/v0.20-issue-1025-pq-signing.md). Both slots are
-# `unsigned` placeholders until R102.M5-001.
+# (design/paideia-as/v0.20-issue-1025-pq-signing.md). Both slots stay
+# `unsigned` placeholders until the dual-sign tooling lands.
 
 name        = pdxterm
-version     = 1.2.0
+version     = 1.3.0
 kind        = tool
 entry       = Main::pdxterm_main
 caps_decl   = caps.decl
@@ -31,6 +47,7 @@ sources:
   - src/window.pdx
   - src/keyboard.pdx
   - src/scrollback.pdx
+  - src/pty_wire.pdx
   - src/ansi.pdx
   - src/schema.pdx
   - src/main.pdx
@@ -41,4 +58,4 @@ signature:
   classical_ed25519 = unsigned
   pq_mldsa          = unsigned
   signed_at         = unsigned
-  note              = "source-form draft per R102.M1-001 (#1); dual-sign lands at R102.M5-001 (#12)"
+  note              = "source-form draft per R102.M1-001 (#1); retroactive M5 milestone close per #12 (Wave BBB, v1.3.0) -- documentation-only, mechanical dual-sign still blocked on org-wide signing tooling"

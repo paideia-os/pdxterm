@@ -1,0 +1,153 @@
+// tests/scrollback_smoke.pdx -- pdxterm R102.M4-004 (issue #11)
+// ScrollbackSmoke module: exercise Scrollback::sb_push_row's
+// overwrite-oldest ring policy directly.
+//
+// Fingerprint: "pdxterm scrollback smoke ok" (r102-user-plan.md
+// R102.M4-004).
+//
+// Scope note (honest divergence from the plan doc)
+// --------------------------------------------------
+// design/graphics/r102-user-plan.md's R102.M4-004 line describes a
+// PageUp/PageDown scroll-view smoke ("pipes 30 lines into an 80x25
+// pdxterm, asserts PageUp scrolls back to reveal the earliest line").
+// No scroll-VIEW feature exists anywhere in this tree yet -- Grid
+// (src/grid.pdx) has no viewport offset, and Scrollback (src/
+// scrollback.pdx, M2-003/#5) exposes only the ring-fill primitive
+// `sb_push_row`, not a read-back-by-viewport-offset API. Building a
+// PageUp/PageDown smoke on top of a scroll-view that does not exist
+// would fabricate a passing test against unimplemented behavior.
+// This landing instead smokes the primitive Scrollback DOES provide,
+// per this wave's dispatch: push 300 rows into the 256-slot ring and
+// assert (a) `head` wraps to 0 at exactly 256 pushes, (b) `head` ends
+// at 300 mod 256 = 44, and (c) the oldest row (slot 0, written by
+// push index 0) is overwritten by push index 256 -- the first push
+// whose pre-advance `head` wraps back to slot 0. A PageUp/PageDown
+// view smoke is left as a follow-up once Grid/Scrollback grow a
+// viewport-offset API to test against.
+//
+// Row-marker scheme
+// ------------------
+// Each pushed row is an 80-byte buffer whose first two bytes encode
+// the push index i (0..299): byte[0] = i & 0xFF, byte[1] = (i >> 8) &
+// 0xFF. Since i < 300 < 512, byte[1] is 0 for i in [0, 255] and 1 for
+// i in [256, 299] -- this disambiguates push index 0 (marker 0x00,
+// 0x00) from push index 256 (marker 0x00, 0x01), which would
+// otherwise collide on byte[0] alone (0 == 256 mod 256).
+//
+// Fingerprint bits (full pass = 0x7):
+//   bit 0 -- after exactly 256 pushes, `head` == 0 (wrap confirmed).
+//   bit 1 -- after all 300 pushes, `head` == 44 (300 mod 256).
+//   bit 2 -- `_scrollback` slot 0 holds the push-256 marker (0x00,
+//            0x01), not the push-0 marker (0x00, 0x00) -- proves the
+//            overwrite-oldest policy fired.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ScrollbackSmoke (PascalCase basename).
+//   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+//   - No 2-op `imul` (no multiplication needed in this file).
+//   - No `and r8..r15, imm64` (the only `and` here targets rax).
+//   - Byte reads via `xor reg, reg; mov_b reg, [ptr]`; byte writes via
+//     plain `mov_b [ptr], reg` (source already masked into [0,255]).
+//   - 2-push-plus-pad prologue (rbx, r12) keeps rsp%16 == 0 at every
+//     nested call (sb_reset, sb_push_row x300), mirroring
+//     Grid::grid_write_char's identical shape (src/grid.pdx).
+//   - Labels prefixed `sbs_`.
+
+module ScrollbackSmoke = structure {
+
+  pub let mut _row_scratch : [u8; 80] = uninit @align(8)
+  pub let mut _sbs_fp      : u64      = uninit @align(8)
+
+  pub let scrollback_smoke_main : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxterm M4-004 (issue #11) scrollback_smoke_main. 2-push (rbx = push index i, r12 = fingerprint) + `sub rsp, 8` prologue: entry rsp%16 == 8 -> push rbx 0 -> push r12 8 -> sub rsp,8 0, matching Grid::grid_write_char's identical 2-push-plus-pad shape, so rsp%16 == 0 at sb_reset and every sb_push_row call. Two sequential bounded loops (i in [0,256) then i in [256,300)) rather than one loop with a mid-loop branch, so the head==0 wrap check sits cleanly between them with no extra conditional inside the hot loop. Row marker built via `and rax, 255` (rax is not r8-r15, so the wide-and pdx encoder pitfall does not apply) and `shr rax, 8; and rax, 255`. All immediates fit imm32 (255, 8, 256, 300, 44, 0, 1, 2, 4). No `test`; every gate is `cmp reg, imm`. Labels prefixed sbs_.",
+      block: {
+        push rbx;                          // rsp%16: 8 -> 0
+        push r12;                          // rsp%16: 0 -> 8
+        sub rsp, 8;                        // rsp%16: 8 -> 0
+
+        xor r12, r12;                      // r12 = fingerprint
+        call sb_reset;
+
+        // ---- Push rows 0..255 (256 pushes; fills the ring exactly once). ----
+        xor rbx, rbx;                      // rbx = i
+      sbs_loop1:
+        cmp rbx, 256;
+        jae sbs_after_256;
+        lea r11, [rip + _row_scratch];
+        mov rax, rbx;
+        and rax, 255;
+        mov_b [r11], rax;                  // byte[0] = i & 0xFF
+        mov rax, rbx;
+        shr rax, 8;
+        and rax, 255;
+        mov_b [r11 + 1], rax;              // byte[1] = (i >> 8) & 0xFF
+        lea rdi, [rip + _row_scratch];
+        call sb_push_row;
+        add rbx, 1;
+        jmp sbs_loop1;
+
+      sbs_after_256:
+        // Exactly 256 pushes done (i = 0..255). head should have
+        // wrapped back to 0.
+        lea r11, [rip + head];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne sbs_wrap_check_done;
+        or r12, 1;
+      sbs_wrap_check_done:
+
+        // ---- Push rows 256..299 (44 more pushes; total 300). ----
+      sbs_loop2:
+        cmp rbx, 300;
+        jae sbs_after_300;
+        lea r11, [rip + _row_scratch];
+        mov rax, rbx;
+        and rax, 255;
+        mov_b [r11], rax;
+        mov rax, rbx;
+        shr rax, 8;
+        and rax, 255;
+        mov_b [r11 + 1], rax;
+        lea rdi, [rip + _row_scratch];
+        call sb_push_row;
+        add rbx, 1;
+        jmp sbs_loop2;
+
+      sbs_after_300:
+        // head should now read 300 mod 256 = 44.
+        lea r11, [rip + head];
+        mov rax, [r11];
+        cmp rax, 44;
+        jne sbs_head_check_done;
+        or r12, 2;
+      sbs_head_check_done:
+
+        // Slot 0 should hold the push-256 marker (0x00, 0x01), not
+        // the push-0 marker (0x00, 0x00) -- the overwrite-oldest
+        // proof.
+        lea r10, [rip + _scrollback];
+        xor rax, rax;
+        mov_b rax, [r10];
+        cmp rax, 0;
+        jne sbs_overwrite_check_done;
+        xor rax, rax;
+        mov_b rax, [r10 + 1];
+        cmp rax, 1;
+        jne sbs_overwrite_check_done;
+        or r12, 4;
+      sbs_overwrite_check_done:
+
+        lea r11, [rip + _sbs_fp];
+        mov [r11], r12;
+        mov rax, r12;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}
