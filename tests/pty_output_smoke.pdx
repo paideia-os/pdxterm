@@ -1,0 +1,258 @@
+// tests/pty_output_smoke.pdx -- pdxterm Wave iota (v1.4.0, ι-05)
+// PtyOutputSmoke module: real pty output, end to end.
+//
+// Scope
+// -----
+// Exercises the real KIND_PTY plumbing paideia-os Wave iota lands
+// (kind_pty.pdx + sys_openpty/SC+ 122) all the way through: this test
+// performs its OWN direct sys_openpty + sys_fork + sys_dup2 + sys_
+// execve("/bin/echo", {"echo","hello",NULL}) sequence -- not through
+// PtyWire::pty_spawn_shell, which always spawns an interactive
+// /bin/sh and whose prompt output would make an exact byte match
+// fragile -- then reads the master fd and asserts the literal bytes
+// "hello\n" land in the scrollback ring's head slot (Scrollback::
+// sb_push_row, src/scrollback.pdx).
+//
+// Poll loop
+// ---------
+// The forked child needs at least one scheduler quantum to run before
+// its `execve`'d /bin/echo produces output the parent's sys_read can
+// observe. The parent polls sys_read up to PTYOS_MAX_ITERS times,
+// sys_sched_wait_ns(PTYOS_POLL_NS)-ing between empty reads (SC+ ID 116,
+// paideia-os sched/sched_wait_ns.pdx) -- a real timer-wheel yield, not
+// a busy-spin. 200 iterations * 1ms = a 200ms budget, generous for a
+// six-byte echo on a cooperative scheduler.
+//
+// Row-content assertion
+// ----------------------
+// `sb_reset()` is called first so the ring's `head` is a known 0 --
+// the pushed row therefore lands at slot 0 ("the scrollback ring's
+// head slot" per this wave's own dispatch wording), and `sb_push_row`
+// also returns that pre-advance index directly for the assertion to
+// check without re-deriving it.
+//
+// Fingerprint bits (full pass = 0x1F):
+//   bit 0 -- sys_openpty succeeded (non-negative packed result).
+//   bit 1 -- sys_fork succeeded (non-negative: 0 in the child, which
+//            never reaches this bit-set code; a positive child pid in
+//            the parent).
+//   bit 2 -- the receive buffer's first six bytes are exactly
+//            "hello\n" (0x68 0x65 0x6C 0x6C 0x6F 0x0A).
+//   bit 3 -- sb_push_row returned row index 0 (the head slot).
+//   bit 4 -- _scrollback[0..6) also reads back exactly "hello\n"
+//            (the ring copy, not just the source buffer).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module PtyOutputSmoke (PascalCase basename).
+//   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+//   - No 2-op `imul` (no multiplication needed in this file).
+//   - No `and r8..r15, imm64`; the widest mask (0xFF) fits imm32.
+//   - Byte compares via `xor reg,reg; mov_b reg,[ptr]` then `cmp`.
+//   - Five-push prologue (rbx, r12, r13, r14, r15) -- odd count, entry
+//     rsp%16==8 flips to rsp%16==0 for every nested call.
+//   - Labels prefixed `ptyos_`.
+
+module PtyOutputSmoke = structure {
+
+  pub let PTYOS_MAX_ITERS : u64 = 200
+  pub let PTYOS_POLL_NS   : u64 = 1000000    // 1 ms
+
+  pub let PROC_PATH_ECHO  : [u8; 10] = "/bin/echo\0"
+  pub let ARGV0_ECHO      : [u8; 5]  = "echo\0"
+  pub let ARGV1_HELLO     : [u8; 6]  = "hello\0"
+
+  pub let mut _ptyos_argv     : [u64; 3] = uninit @align(8)
+  pub let mut _ptyos_recv_buf : [u8; 80] = uninit @align(8)
+  pub let mut _ptyos_fp       : u64      = uninit @align(8)
+
+  pub let pty_output_smoke_main : () -> u64 !{mem, sysreg} @{cap, sched, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched, fs},
+      justification: "Wave iota (ι-05) pty_output_smoke_main. Five-push prologue (rbx=master_fd, r12=slave_fd, r13=collected byte count, r14=poll iteration counter, r15=fingerprint) -- odd count, entry rsp%16==8 flips to rsp%16==0 for every nested call. Phase 1: sb_reset() so `head` starts at a known 0. Phase 2: sys_openpty(24, 80); sign-bit test (`shr r10,63`) sets bit 0 on success and stashes master_fd/slave_fd (rax&0xFF, (rax>>8)&0xFF) into rbx/r12; on failure jumps straight to the fingerprint-store epilogue (bits 1..4 stay 0, matching every other honest-blockage test in this repo -- a real openpty failure means the rest of the sequence cannot be exercised, not a fabricated partial pass). Phase 3: sys_fork(); sign-bit test on failure -> epilogue; `cmp rax,0; je ptyos_child` branches. CHILD: three sys_dup2(slave_fd, {0,1,2}), builds `_ptyos_argv = {&ARGV0_ECHO, &ARGV1_HELLO, 0}` via three stores, `sys_execve(&PROC_PATH_ECHO, &_ptyos_argv, 0)`; if it returns (failed), `sys_exit(1)` -- both never return in practice, the trailing `ret` is unreachable dead code per this tree's own 'never returns' convention (see PtyWire::pty_spawn_shell's identical child-branch shape). PARENT: sets bit 1, zeroes r13 (collected) and r14 (iters), enters ptyos_poll_loop: sys_read(master_fd, &_ptyos_recv_buf[collected], 80-collected); a nonzero return advances r13 by rax and, once r13>=6, exits the loop; a zero return calls sys_sched_wait_ns(1000000) before the next iteration; the loop bails after PTYOS_MAX_ITERS(200) iterations regardless (bounded -- this is a smoke test, not an infinite wait). After the loop: six-byte unrolled compare of `_ptyos_recv_buf[0..6)` against 'h','e','l','l','o','\n' (0x68/0x65/0x6C/0x6C/0x6F/0x0A) via `xor reg,reg; mov_b reg,[ptr+N]; cmp reg,imm` per byte -> bit 2 iff all six match. `call sb_push_row(&_ptyos_recv_buf)` -> rax = pre-advance row index; `cmp rax,0` -> bit 3 iff it is the head slot (0, guaranteed by the Phase-1 reset absent a prior push). Final six-byte compare of `_scrollback[0..6)` (via `lea r10,[rip+_scrollback]`) against the same six bytes -> bit 4. Store fingerprint to `_ptyos_fp`, return it in rax. Effects {mem,sysreg}: mem for every buffer/ring write; sysreg transitively from every syscall wrapper. Capabilities {cap,sched,fs}: cap from sys_openpty/sys_cap_invoke (not used here directly, but sys_openpty declares it), sched from sys_fork/sys_execve/sys_sched_wait_ns, fs from sys_read/sys_dup2. Labels prefixed ptyos_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        xor r15, r15;                        // fingerprint
+
+        call sb_reset;
+
+        // Phase 2: sys_openpty(24, 80)
+        mov rdi, 24;
+        mov rsi, 80;
+        call sys_openpty;
+
+        mov r10, rax;
+        shr r10, 63;
+        cmp r10, 0;
+        jne ptyos_done;                      // openpty failed -> no further bits
+
+        or r15, 1;
+
+        mov rbx, rax;
+        and rbx, 0xFF;                       // master_fd
+        mov r12, rax;
+        shr r12, 8;
+        and r12, 0xFF;                       // slave_fd
+
+        // Phase 3: sys_fork()
+        call sys_fork;
+
+        mov r10, rax;
+        shr r10, 63;
+        cmp r10, 0;
+        jne ptyos_done;                      // fork failed -> no further bits
+
+        cmp rax, 0;
+        je  ptyos_child;
+
+        // ---- PARENT branch ----
+        or r15, 2;
+
+        xor r13, r13;                        // collected byte count
+        xor r14, r14;                        // poll iteration counter
+
+      ptyos_poll_loop:
+        cmp r14, 200;                        // PTYOS_MAX_ITERS
+        jae ptyos_poll_done;
+
+        mov rdi, rbx;                        // master_fd
+        lea rsi, [rip + _ptyos_recv_buf];
+        add rsi, r13;                        // write at current offset
+        mov rdx, 80;
+        sub rdx, r13;                        // remaining capacity
+        cmp rdx, 0;
+        je  ptyos_poll_done;                 // buffer full
+        call sys_read;
+
+        cmp rax, 0;
+        je  ptyos_poll_wait;
+
+        add r13, rax;
+        cmp r13, 6;
+        jae ptyos_poll_done;
+        jmp ptyos_poll_next;
+
+      ptyos_poll_wait:
+        mov rdi, 1000000;                    // PTYOS_POLL_NS
+        call sys_sched_wait_ns;
+
+      ptyos_poll_next:
+        add r14, 1;
+        jmp ptyos_poll_loop;
+
+      ptyos_poll_done:
+        // Six-byte compare: _ptyos_recv_buf[0..6) == "hello\n".
+        lea r10, [rip + _ptyos_recv_buf];
+        xor rax, rax;
+        mov_b rax, [r10 + 0];
+        cmp rax, 0x68;                       // 'h'
+        jne ptyos_word_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 1];
+        cmp rax, 0x65;                       // 'e'
+        jne ptyos_word_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 2];
+        cmp rax, 0x6C;                       // 'l'
+        jne ptyos_word_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 3];
+        cmp rax, 0x6C;                       // 'l'
+        jne ptyos_word_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 4];
+        cmp rax, 0x6F;                       // 'o'
+        jne ptyos_word_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 5];
+        cmp rax, 0x0A;                       // '\n'
+        jne ptyos_word_mismatch;
+        or r15, 4;
+      ptyos_word_mismatch:
+
+        lea rdi, [rip + _ptyos_recv_buf];
+        call sb_push_row;
+        cmp rax, 0;
+        jne ptyos_row_mismatch;
+        or r15, 8;
+      ptyos_row_mismatch:
+
+        lea r10, [rip + _scrollback];
+        xor rax, rax;
+        mov_b rax, [r10 + 0];
+        cmp rax, 0x68;
+        jne ptyos_ring_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 1];
+        cmp rax, 0x65;
+        jne ptyos_ring_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 2];
+        cmp rax, 0x6C;
+        jne ptyos_ring_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 3];
+        cmp rax, 0x6C;
+        jne ptyos_ring_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 4];
+        cmp rax, 0x6F;
+        jne ptyos_ring_mismatch;
+        xor rax, rax;
+        mov_b rax, [r10 + 5];
+        cmp rax, 0x0A;
+        jne ptyos_ring_mismatch;
+        or r15, 16;
+      ptyos_ring_mismatch:
+
+        jmp ptyos_done;
+
+        // ---- CHILD branch ----
+      ptyos_child:
+        mov rdi, r12;                        // slave_fd
+        mov rsi, 0;
+        call sys_dup2;
+        mov rdi, r12;
+        mov rsi, 1;
+        call sys_dup2;
+        mov rdi, r12;
+        mov rsi, 2;
+        call sys_dup2;
+
+        lea r10, [rip + ARGV0_ECHO];
+        lea r11, [rip + _ptyos_argv];
+        mov [r11 + 0], r10;
+        lea r10, [rip + ARGV1_HELLO];
+        mov [r11 + 8], r10;
+        xor r10, r10;
+        mov [r11 + 16], r10;
+
+        lea rdi, [rip + PROC_PATH_ECHO];
+        lea rsi, [rip + _ptyos_argv];
+        xor rdx, rdx;
+        call sys_execve;
+
+        mov rdi, 1;
+        call sys_exit;
+        ret;
+
+      ptyos_done:
+        lea r11, [rip + _ptyos_fp];
+        mov [r11], r15;
+        mov rax, r15;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

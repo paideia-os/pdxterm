@@ -1,5 +1,42 @@
 # pdxterm CHANGELOG
 
+## v1.4.0 -- 2026-09-14 (Wave iota: real KIND_PTY body, ι-03/ι-04/ι-05)
+
+Closes the KIND_PTY kernel gap v1.3.0 (#6) disclosed. paideia-os now
+ships `kind_pty.pdx` (KIND_PTY = 0x1E7, 32-row pool) + `sys_openpty`/
+`sys_grantpt`/`sys_unlockpt` (SC+ 122/123/124) -- see the monorepo's
+`design/kernel/wave-iota-pty.md`.
+
+- `src/pty_wire.pdx` (ι-03) -- `pty_spawn_shell` replaced the
+  `sys_cap_invoke` stub with a real sequence: `sys_openpty(24, 80)` ->
+  unpack `master_fd | (slave_fd << 8) | (cap_slot << 16)` -> `sys_fork`
+  -> child does `sys_dup2(slave_fd, {0,1,2})` + `sys_execve("/bin/sh",
+  {"sh", NULL}, NULL)` (falling back to `sys_exit(1)` if execve
+  returns) -> parent registers itself as the pty's session leader via
+  `sys_cap_invoke(cap_slot, OP_PTY_SET_SESSION_PID | (child_pid << 8))`
+  and keeps `master_fd` for I/O. New `pty_read_master(buf, cap)` seam
+  (non-blocking master-fd read). `pty_drain_keyboard_to_master` now
+  performs a real `sys_write` instead of staging a byte count.
+- `src/pty_resize.pdx` (new, ι-04) -- `Module PtyResize`:
+  `pty_resize_notify(rows, cols)` packs a `cap_handler_pty.pdx`
+  `OP_PTY_SET_DIMS` payload and dispatches `sys_cap_invoke` against
+  `PtyWire::_pty_cap_slot`. Kernel side stores the new winsize and
+  calls `pty_winch_notify` against the registered session leader pid --
+  a SIGWINCH-shaped pending-counter bump, not a real POSIX signal (this
+  kernel has no generic signal-delivery path yet).
+- `tests/pty_output_smoke.pdx` (new, ι-05) -- forks + `execve`'s
+  `/bin/echo hello` through its own real pty pair (independent of
+  `pty_spawn_shell`, to avoid depending on an interactive shell's
+  prompt output), polls the master fd via `sys_read` +
+  `sys_sched_wait_ns` (SC+ 116) yields, and asserts the literal bytes
+  `"hello\n"` land in both the receive buffer and `Scrollback`'s head
+  slot (`sb_push_row` after `sb_reset`). 5-bit fingerprint, full pass
+  `0x1F`.
+- `src/syscall.pdx` -- five new sysno wrappers matching the monorepo
+  canonical shim byte-for-byte: `sys_read` (0), `sys_write` (1),
+  `sys_dup2` (32), `sys_fork` (56), `sys_execve` (59), `sys_exit` (60),
+  `sys_openpty` (122), `sys_sched_wait_ns` (116).
+
 ## v1.3.0 -- 2026-09-13 (Wave BBB: 4-issue tail, issues #6/#11/#12/#15)
 
 Landing shape: closes the last four open issues in the tracker.

@@ -1,124 +1,151 @@
-// src/pty_wire.pdx -- pdxterm R102.M3-001 (issue #6)
-// PtyWire module: KIND_PTY spawn request + shell attach seams.
+// src/pty_wire.pdx -- pdxterm R102.M3-001 (issue #6) + Wave iota
+// (v1.4.0, real KIND_PTY body)
+// PtyWire module: real KIND_PTY mint + fork + execve("/bin/sh") shell
+// attach.
 //
 // Scope
 // -----
-// Per design/graphics/r102-user-plan.md R102.M3-001: mint KIND_PTY
-// (§7.2.3), spawn /bin/shell as a child with argv[0]="sh", attach the
-// master end to pdxterm's keyboard input feed (Keyboard::_pty_out_ring,
-// src/keyboard.pdx) and the slave end's output bytes into the grid
-// render path (Ansi::ansi_feed_bytes, src/ansi.pdx).
+// Wave OO's landing of this file was a fail-closed stub: paideia-os had
+// no `kind_pty.pdx` dispatch body and no dedicated pty syscall, so
+// `pty_spawn_shell` dispatched a PROPOSED op through the generic
+// `sys_cap_invoke` (SC+ ID 4) against a reserved cap-slot hint and
+// documented the expected `-EBADF` as a genuine, disclosed kernel gap.
 //
-// Kernel-gap disclosure
-// ----------------------
-// KIND_PTY has NO kernel-side substrate at Wave OO: there is no
-// `kind_pty.pdx` dispatch body and no dedicated mint sysno (the
-// highest landed dedicated sysno is 115, `sys_semantic_send`, per
-// design/user/syscall-table.md; a dedicated `sys_pty_mint` would sit
-// at the next contiguous FLOOR sysno, 116, following the "contiguous-
-// with-last-allocated-sysno" dispatch discipline that same doc names
-// for sysnos 104-115). §7.2.3 frames KIND_PTY's ops (mint, write,
-// read, revoke) in the generic cap-invoke shape several other cap
-// kinds already use without a new sysno (e.g. `KIND_PDXFS_FILE`'s
-// `PFF_OP_READ_BYTES`, design/user/syscall-table.md's #2109 note) --
-// this file takes THAT route: it dispatches through the already-
-// landed generic `sys_cap_invoke` (SC+ ID 4, src/user/syscall_shim.pdx
-// row 5; wrapped locally as `Syscall::sys_cap_invoke` in
-// src/syscall.pdx) against a reserved candidate cap slot
-// (PTY_CAP_SLOT_HINT) with a PROPOSED op encoding (PTY_OP_SPAWN = 1)
-// that has no kernel-side handler yet. The call is expected to come
-// back a negative errno (most likely `-EBADF`, since no mint has ever
-// populated that cap-table slot) until R101 lands a real KIND_PTY
-// dispatch body -- this is a genuine, disclosed kernel gap, not a
-// simulated one; per the R102 plan's own §7.3 escalation posture
-// ("file an issue against paideia-os/paideia-os under the R101
-// milestone, push a stub in R102 that fails closed, and resume"),
-// the fail-closed stub is what this file provides. `pty_spawn_shell`
-// always records the raw syscall result + a blockage marker
-// (PTY_BLOCKED_KERNEL_GAP = 0x8003, next in the per-repo blockage-code
-// sequence after Window's 0x8002) rather than fabricating a live
-// master/slave fd pair.
+// paideia-os Wave iota closes that gap: `kind_pty.pdx` (KIND_PTY =
+// 0x1E7) plus `sys_openpty` (SC+ ID 122) now mint a real 32-row pty
+// pair and hand back `master_fd | (slave_fd << 8) | (cap_slot << 16)`.
+// This landing replaces the stub with the real sequence:
 //
-// Attach seams (wired now, fed for real once R101 lands KIND_PTY)
-// -----------------------------------------------------------------
-//   - `pty_drain_keyboard_to_master()` is the master-fd attach point:
-//     it reads Keyboard::_pty_out_head (src/keyboard.pdx) -- the
-//     count of translated keystroke bytes waiting in
-//     Keyboard::_pty_out_ring -- and stages that count into
-//     _pty_master_bytes_pending. Once a live master fd exists, this
-//     function's body becomes a `sys_write(_pty_master_fd,
-//     &_pty_out_ring[0], head)` call; the call site here is already
-//     the keyboard-input-feed seam the issue asks for.
-//   - `pty_feed_slave_bytes(ptr, len)` is the slave-fd attach point:
-//     it forwards directly to `Ansi::ansi_feed_bytes(ptr, len)`
-//     (src/ansi.pdx), which is the live grid-render path the three
-//     already-CLOSED M3/M4 fingerprint tests exercise. Once a live
-//     slave fd exists, its `sys_read` result buffer is handed to this
-//     same function unchanged.
+//   1. sys_openpty(PTY_DEFAULT_ROWS=24, PTY_DEFAULT_COLS=80) -> packed
+//      result or a negative errno (tested via the sign bit, `shr rax,
+//      63`, rather than comparing against a specific errno constant --
+//      every legal packed result has bit 63 clear since it is bounded
+//      to 24 bits, so a sign-bit test is a clean, errno-value-agnostic
+//      failure gate).
+//   2. Unpack master_fd/slave_fd/cap_slot into `.bss` (still copied
+//      byte-for-byte into the child's own aspace at the next step's
+//      `fork()`, so the child observes the same three values without
+//      re-deriving them).
+//   3. sys_fork(). Same sign-bit test distinguishes a real -errno from
+//      the two valid returns (0 in the child, a positive child pid in
+//      the parent -- pids are always small positive values, per
+//      sys_kill.pdx's own `MAX_PIDS = 64` bound, so bit 63 is never
+//      legitimately set on a live pid).
+//   4. CHILD branch: dup2(slave_fd, 0/1/2), then execve("/bin/sh",
+//      argv={"sh", NULL}, envp=NULL). If execve returns at all, it
+//      failed (POSIX execve never returns on success) -- exit(1).
+//   5. PARENT branch: registers itself as the pty's session leader via
+//      `sys_cap_invoke(cap_slot, OP_PTY_SET_SESSION_PID | (child_pid <<
+//      8))` (kind_pty.pdx's cap_handler_pty op 5) so ι-04's resize path
+//      has a real pid to notify, then keeps master_fd for I/O.
 //
-// argv[0]="sh": staged as a `.rodata` NUL-terminated fixture
-// (PROC_ARGV0_SH) for the eventual real spawn (sys_execve + sys_dup2
-// per the plan doc's M3-001 scope line -- both sysnos already exist
-// in the kernel tree, src/kernel/core/syscall/handlers/sys_execve.pdx
-// and sys_dup2.pdx); not issued yet since it is gated on a live slave
-// fd from a successful KIND_PTY mint.
+// A failure at either step 1 or step 3 sets `_pty_blocked` to
+// `PTY_BLOCKED_RUNTIME_FAIL` (0x8004, next in this repo's blockage-code
+// sequence after this file's own prior 0x8003 kernel-gap marker) and
+// returns 0 (Wave OO's convention: no error signalling to the caller
+// beyond the `.bss` audit trail, matching Window::window_request_
+// surface). This is now a genuine RUNTIME failure path (out of ptys,
+// fork table full), not a disclosed missing-kernel-substrate gap --
+// under normal boot conditions this landing expects it to be
+// unreachable.
+//
+// Attach seams
+// ------------
+//   - `pty_drain_keyboard_to_master()` now performs the real write: it
+//     reads Keyboard::_pty_out_head (src/keyboard.pdx) -- the write
+//     cursor into the 4096-byte `_pty_out_ring` -- and, if nonzero,
+//     calls `sys_write(_pty_master_fd, &_pty_out_ring[0], head)`, then
+//     resets `_pty_out_head` to 0. KNOWN SIMPLIFICATION: this treats
+//     the ring as a batch buffer that is fully drained and reset on
+//     every call rather than a true wraparound-safe SPSC ring (it never
+//     reads the region behind a stale, un-reset head across multiple
+//     fill cycles); safe as long as this function is called at least
+//     once between any two 4096-byte fills, which every realistic
+//     per-frame call cadence satisfies. A byte-accurate wraparound
+//     consumer is a follow-up once a real per-event keyboard loop lands
+//     and this assumption needs revisiting.
+//   - `pty_feed_slave_bytes(ptr, len)` is unchanged from Wave OO:
+//     forwards to `Ansi::ansi_feed_bytes(ptr, len)`. Once a real read
+//     loop calls `pty_read_master` (below), its output buffer feeds
+//     this function unchanged.
+//   - `pty_read_master(buf_ptr, cap)` (NEW, Wave iota): non-blocking
+//     `sys_read(_pty_master_fd, buf_ptr, cap)`, returning the byte count
+//     (0 if the pty ring was empty, matching kind_pty.pdx's own
+//     PTY_RING_EMPTY-stops-the-loop posture) or 0 on a negative errno
+//     (no live master fd yet). This is the master-fd READ half ι-04's
+//     resize path and a future real render loop both need; it is not
+//     wired into a loop by this landing (no event-loop driver exists
+//     yet, same posture Main::pdxterm_main's own header documents) but
+//     is directly exercised by tests/pty_output_smoke.pdx.
 //
 // paideia-as compliance
 // ---------------------
 //   - Module PtyWire (PascalCase basename).
 //   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
 //   - No 2-op `imul` (no multiplication needed in this file).
-//   - No `and r8..r15, imm64`.
-//   - Byte literal ("sh\0") stored as a 3-byte `.rodata` array.
+//   - No `and r8..r15, imm64`; the widest masks (0xFF, 0xFFFF) fit
+//     imm32 with bit 31 clear.
+//   - Byte literals ("sh\0", "/bin/sh\0") stored as `.rodata` arrays.
 //   - r11 scratch for every rip-relative lea; r10 for a second base
 //     pointer where two rip-relative addresses are live at once.
-//   - pty_reset, pty_drain_keyboard_to_master and pty_feed_slave_bytes
-//     are leaves; pty_spawn_shell issues one nested call
-//     (sys_cap_invoke) and needs no push/pop since it touches no
-//     callee-saved register across that call.
 //   - Labels prefixed `pty_`.
 
 module PtyWire = structure {
 
-  // Reserved candidate cap-table slot pdxterm requests the loader (or
-  // a future KIND_PTY mint path) populate. Arbitrary until R101
-  // defines a real allocation convention for pty pairs; chosen above
-  // the highest reserved-slot precedent this tree has seen documented
-  // (design/user/syscall-table.md cites transient KIND_MEMORY parents
-  // at slots 132/134 for volume/framebuffer mint staging).
+  // Reserved candidate cap-table slot from the Wave OO stub landing.
+  // Superseded: the real cap slot now comes back from sys_openpty's own
+  // packed result (bits [23:16]) rather than being a caller-chosen
+  // hint. Kept only as a historical constant; no longer referenced by
+  // pty_spawn_shell.
   pub let PTY_CAP_SLOT_HINT : u64 = 136
 
-  // PROPOSED op encoding for KIND_PTY's cap-invoke dispatch (§7.2.3
-  // names mint/write/read/revoke; PTY_OP_SPAWN folds "mint a pair +
-  // spawn /bin/sh onto the slave end" into a single op since that is
-  // the only operation pdxterm's M3-001 scope needs). No kernel-side
-  // dispatch entry exists for this op yet -- see file header.
-  pub let PTY_OP_SPAWN : u64 = 1
+  // cap_handler_pty.pdx op ordinals (paideia-os cap/handlers/
+  // cap_handler_pty.pdx). Only SET_SESSION_PID is used by this file;
+  // the others are named here for completeness / future resize and
+  // query call sites (ι-04's PtyResize module uses OP_PTY_SET_DIMS).
+  pub let OP_PTY_QUERY_DIMS        : u64 = 0
+  pub let OP_PTY_SET_DIMS          : u64 = 1
+  pub let OP_PTY_QUERY_MASTER_FD   : u64 = 2
+  pub let OP_PTY_QUERY_SLAVE_FD    : u64 = 3
+  pub let OP_PTY_QUERY_SESSION_PID : u64 = 4
+  pub let OP_PTY_SET_SESSION_PID   : u64 = 5
+
+  pub let PTY_DEFAULT_ROWS : u64 = 24
+  pub let PTY_DEFAULT_COLS : u64 = 80
 
   // Blockage marker convention: matches Window::SURFACE_BLOCKED_GFX_LINK
-  // (0x8002, src/window.pdx) and ShellEchoRoundtrip's 0x8001
-  // (tests/shell_echo_roundtrip.pdx). Next in sequence for this repo.
-  pub let PTY_BLOCKED_KERNEL_GAP : u64 = 0x8003
+  // (0x8002, src/window.pdx) and this file's own prior 0x8003
+  // kernel-gap marker (Wave OO, now closed). 0x8004 is next in
+  // sequence, reused for a genuine RUNTIME failure (see file header).
+  pub let PTY_BLOCKED_KERNEL_GAP    : u64 = 0x8003   // historical (Wave OO); unreachable now
+  pub let PTY_BLOCKED_RUNTIME_FAIL  : u64 = 0x8004
 
-  pub let PROC_ARGV0_SH : [u8; 3] = "sh\0"
+  pub let PROC_ARGV0_SH   : [u8; 3] = "sh\0"
+  pub let PROC_PATH_SH    : [u8; 8] = "/bin/sh\0"
 
   pub let mut _pty_master_fd            : u64 = uninit @align(8)
   pub let mut _pty_slave_fd             : u64 = uninit @align(8)
+  pub let mut _pty_cap_slot             : u64 = uninit @align(8)
+  pub let mut _pty_child_pid            : u64 = uninit @align(8)
   pub let mut _pty_spawn_result         : u64 = uninit @align(8)
   pub let mut _pty_blocked              : u64 = uninit @align(8)
   pub let mut _pty_master_bytes_pending : u64 = uninit @align(8)
   pub let mut _pty_slave_bytes_rendered : u64 = uninit @align(8)
+  // argv[] scratch for the child's execve: {&PROC_ARGV0_SH, 0}.
+  pub let mut _pty_argv : [u64; 2] = uninit @align(8)
 
-  // pty_reset() -- home every .bss slot (fd fields to 0, meaning "no
-  // live fd"; blockage/result/counters to 0).
+  // pty_reset() -- home every .bss slot (fd/cap/pid fields to 0,
+  // meaning "no live fd/cap/pid"; blockage/result/counters to 0).
   pub let pty_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "pdxterm M3-001 (issue #6) pty_reset. Zero all six .bss slots. Leaf; r11 scratch for every rip-relative store. No push/pop parity.",
+      justification: "Wave iota pty_reset. Zero all eight .bss slots (Wave OO's six plus _pty_cap_slot and _pty_child_pid). Leaf; r11 scratch for every rip-relative store. No push/pop parity.",
       block: {
         xor rax, rax;
         lea r11, [rip + _pty_master_fd];            mov [r11], rax;
         lea r11, [rip + _pty_slave_fd];             mov [r11], rax;
+        lea r11, [rip + _pty_cap_slot];             mov [r11], rax;
+        lea r11, [rip + _pty_child_pid];            mov [r11], rax;
         lea r11, [rip + _pty_spawn_result];         mov [r11], rax;
         lea r11, [rip + _pty_blocked];              mov [r11], rax;
         lea r11, [rip + _pty_master_bytes_pending]; mov [r11], rax;
@@ -128,85 +155,208 @@ module PtyWire = structure {
     }
 
   // pty_spawn_shell() -> u64
-  //   Dispatches sys_cap_invoke(PTY_CAP_SLOT_HINT, PTY_OP_SPAWN) --
-  //   see file header for why this is expected to fail closed at
-  //   Wave OO (no kernel-side KIND_PTY substrate). Stores the raw
-  //   result, sets the blockage marker on any non-zero (negative
-  //   errno) return, and leaves _pty_master_fd/_pty_slave_fd at 0
-  //   (no live fds). On a hypothetical future zero return (kernel
-  //   gap closed), fds stay 0 here too -- the ABI for how a live
-  //   mint+spawn returns the fd pair is not yet specified by R101, so
-  //   this function does not guess at unpacking rax; that unpacking
-  //   is the follow-up once R101's real return shape is documented.
-  //   Always returns 0 (Wave OO: no error signalling to the caller
-  //   beyond the .bss audit trail, matching
-  //   Window::window_request_surface's convention).
-  pub let pty_spawn_shell : () -> u64 !{mem, sysreg} @{cap} =
+  //   Real KIND_PTY mint + fork + execve sequence. See file header for
+  //   the full step-by-step contract. Always returns 0 in the PARENT
+  //   (Wave OO's no-error-signalling convention; failures are recorded
+  //   in `.bss` for a caller/test to inspect). The CHILD branch never
+  //   returns from this function at all -- it ends in either a
+  //   successful `execve` (process image replaced) or `sys_exit(1)`.
+  pub let pty_spawn_shell : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {cap},
-      justification: "pdxterm M3-001 (issue #6) pty_spawn_shell. Leaf across its one nested call: every register live before/after `call sys_cap_invoke` (rdi, rsi, rax) is SysV caller-save, so no push/pop is needed even though this issues a real syscall. rdi=PTY_CAP_SLOT_HINT, rsi=PTY_OP_SPAWN loaded immediately before the call (no other register traffic to preserve). Result checked via `cmp rax, 0; jne` (same idiom as Schema::term_event_emit's rc check, src/schema.pdx line 180) rather than a signed js/jl, since sys_cap_invoke's only defined success value is exactly 0 (any negative errno takes the blocked path). All immediates fit imm32 (136, 1, 0x8003). No `test`. Effect/capability tail !{mem, sysreg} @{cap} matches Syscall::sys_cap_invoke byte-for-byte plus the .bss stores this wrapper adds. Labels prefixed pty_.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "Wave iota pty_spawn_shell. Five-push prologue (rbx=master_fd, r12=slave_fd, r13=cap_slot, r14=child_pid, r15=spare) -- ODD push count, entry rsp%16==8 flips to rsp%16==0 for every nested call, matching cap_handler_pty.pdx's identical odd-push-count reasoning; no stack push/pop needed anywhere in the body. Phase 1: sys_openpty(24, 80) -> rax; `mov r10, rax; shr r10, 63; cmp r10, 0; jne pty_spawn_blocked` -- sign-bit test distinguishes a negative errno (bit 63 set) from a legal packed result (bounded to 24 bits, bit 63 always clear), avoiding a dependency on any specific errno value. Phase 2: unpack rbx=master_fd (rax & 0xFF), r12=slave_fd ((rax>>8)&0xFF), r13=cap_slot ((rax>>16)&0xFF); store all three to .bss immediately (fork() below copies the aspace, so the child's own copy of these .bss slots is already correct without re-deriving anything). Phase 3: sys_fork() -> rax; same sign-bit test -> pty_spawn_blocked on failure. `cmp rax, 0; je pty_spawn_child` -- child branch. Parent branch (r14 = child_pid = rax): packs op_arg = OP_PTY_SET_SESSION_PID(5) | (child_pid << 8) and calls sys_cap_invoke(cap_slot, op_arg) to register itself as session leader (best-effort; return value ignored -- a failed registration only means ι-04's SIGWINCH-shaped notify silently no-ops, not a spawn failure), stores child_pid to .bss, returns 0. Child branch: three sys_dup2(slave_fd, {0,1,2}) calls (slave_fd reloaded from r12, which fork's aspace-clone preserved identically in the child), builds `_pty_argv = {&PROC_ARGV0_SH, 0}` via two stores, then `sys_execve(&PROC_PATH_SH, &_pty_argv, 0)`. If execve returns (it never does on success per POSIX), falls through to `sys_exit(1)` -- also never returns; the `ret` after it is unreachable dead code kept only so the block has a syntactically valid exit, matching every other 'never returns' syscall wrapper in this tree's own convention (see src/user/syscall_shim.pdx sys_exit's identical trailing `ret`). pty_spawn_blocked: sets _pty_blocked = PTY_BLOCKED_RUNTIME_FAIL (0x8004), fds/cap_slot/child_pid stay at whatever pty_reset last set (0), returns 0. Effects {mem,sysreg}: mem for every .bss store; sysreg transitively from sys_openpty/sys_fork/sys_execve/sys_cap_invoke. Capabilities {cap,sched}: cap from sys_openpty/sys_cap_invoke, sched from sys_fork/sys_execve. Labels prefixed pty_.",
       block: {
-        mov rdi, 136;                      // PTY_CAP_SLOT_HINT
-        mov rsi, 1;                        // PTY_OP_SPAWN
-        call sys_cap_invoke;
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Phase 1: sys_openpty(PTY_DEFAULT_ROWS, PTY_DEFAULT_COLS)
+        mov rdi, 24;                        // PTY_DEFAULT_ROWS
+        mov rsi, 80;                        // PTY_DEFAULT_COLS
+        call sys_openpty;
 
         lea r11, [rip + _pty_spawn_result];
         mov [r11], rax;
 
-        cmp rax, 0;
+        mov r10, rax;
+        shr r10, 63;
+        cmp r10, 0;
         jne pty_spawn_blocked;
 
-        // Hypothetical success: no live fd-unpack ABI documented by
-        // R101 yet, so fds stay at whatever pty_reset last set (0).
-        // No blockage marker set on this path.
+        // Phase 2: unpack + stash to .bss
+        mov rbx, rax;
+        and rbx, 0xFF;                      // master_fd
+        mov r12, rax;
+        shr r12, 8;
+        and r12, 0xFF;                      // slave_fd
+        mov r13, rax;
+        shr r13, 16;
+        and r13, 0xFF;                      // cap_slot
+
+        lea r11, [rip + _pty_master_fd]; mov [r11], rbx;
+        lea r11, [rip + _pty_slave_fd];  mov [r11], r12;
+        lea r11, [rip + _pty_cap_slot];  mov [r11], r13;
+
+        // Phase 3: sys_fork()
+        call sys_fork;
+
+        mov r10, rax;
+        shr r10, 63;
+        cmp r10, 0;
+        jne pty_spawn_blocked;
+
+        cmp rax, 0;
+        je  pty_spawn_child;
+
+        // ---- PARENT branch ----
+        mov r14, rax;                       // child_pid
+        lea r11, [rip + _pty_child_pid];
+        mov [r11], r14;
+
+        mov rdi, r13;                       // cap_slot
+        mov rsi, r14;
+        shl rsi, 8;
+        mov r10, 5;                         // OP_PTY_SET_SESSION_PID
+        or  rsi, r10;
+        call sys_cap_invoke;
+
         xor rax, rax;
-        ret
+        jmp pty_spawn_out;
+
+        // ---- CHILD branch ----
+      pty_spawn_child:
+        mov rdi, r12;                       // slave_fd
+        mov rsi, 0;
+        call sys_dup2;
+        mov rdi, r12;
+        mov rsi, 1;
+        call sys_dup2;
+        mov rdi, r12;
+        mov rsi, 2;
+        call sys_dup2;
+
+        lea r10, [rip + PROC_ARGV0_SH];
+        lea r11, [rip + _pty_argv];
+        mov [r11 + 0], r10;
+        xor r10, r10;
+        mov [r11 + 8], r10;
+
+        lea rdi, [rip + PROC_PATH_SH];
+        lea rsi, [rip + _pty_argv];
+        xor rdx, rdx;
+        call sys_execve;
+
+        // execve returned -> it failed. Never returns.
+        mov rdi, 1;
+        call sys_exit;
+        ret;
 
       pty_spawn_blocked:
-        mov rax, 0x8003;                   // PTY_BLOCKED_KERNEL_GAP
+        mov rax, 0x8004;                    // PTY_BLOCKED_RUNTIME_FAIL
         lea r11, [rip + _pty_blocked];
         mov [r11], rax;
         xor rax, rax;
+
+      pty_spawn_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
         ret
       }
     }
 
   // pty_drain_keyboard_to_master() -> u64
-  //   Master-fd attach seam: reads the count of translated keystroke
-  //   bytes waiting in Keyboard::_pty_out_ring (src/keyboard.pdx,
-  //   already landed at M2-002/#4) via Keyboard::_pty_out_head, and
-  //   stages that count into _pty_master_bytes_pending. Returns the
-  //   staged count. Once a live master fd exists (R101 KIND_PTY),
-  //   this body's final store becomes a
-  //   `sys_write(_pty_master_fd, &_pty_out_ring[0], head)` call
-  //   instead -- the read of Keyboard's ring head is already the
-  //   correct seam.
-  pub let pty_drain_keyboard_to_master : () -> u64 !{mem} @{} =
+  //   Real master-fd write. See file header "Attach seams" for the
+  //   batch-drain simplification this landing takes. Returns the byte
+  //   count written (0 if the ring was empty or the write failed).
+  pub let pty_drain_keyboard_to_master : () -> u64 !{mem, sysreg} @{fs} =
     fn () -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "pdxterm M3-001 (issue #6) pty_drain_keyboard_to_master. Leaf; r11 scratch for both rip-relative accesses. Reads the existing Keyboard::_pty_out_head observability slot (src/keyboard.pdx) rather than re-deriving ring occupancy, so this seam stays correct if Keyboard's ring-fill policy ever changes. No `test`; no branch at all in this body. No push/pop parity.",
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "Wave iota pty_drain_keyboard_to_master. One-push prologue (rbx = head) -- ODD push count, entry rsp%16==8 flips directly to rsp%16==0 for the nested sys_write call (no extra pad needed, unlike a two-push prologue). Reads Keyboard::_pty_out_head; if 0, nothing to send, skip the syscall entirely and return 0. Otherwise sys_write(_pty_master_fd, &_pty_out_ring[0], head), stash the byte count into _pty_master_bytes_pending (kept for observability parity with the Wave OO field name), reset _pty_out_head to 0 (batch-drain simplification, see file header), and return the count sys_write reported (which may be less than `head` on a partial write -- forwarded verbatim, not re-driven into a retry loop at this landing). Labels prefixed pty_.",
       block: {
+        push rbx;
+
         lea r11, [rip + _pty_out_head];
-        mov rax, [r11];
+        mov rbx, [r11];
+        cmp rbx, 0;
+        je  pty_drain_empty;
+
+        lea r11, [rip + _pty_master_fd];
+        mov rdi, [r11];
+        lea rsi, [rip + _pty_out_ring];
+        mov rdx, rbx;
+        call sys_write;
+
         lea r11, [rip + _pty_master_bytes_pending];
         mov [r11], rax;
+
+        lea r11, [rip + _pty_out_head];
+        xor r10, r10;
+        mov [r11], r10;
+        jmp pty_drain_out;
+
+      pty_drain_empty:
+        xor rax, rax;
+        lea r11, [rip + _pty_master_bytes_pending];
+        mov [r11], rax;
+
+      pty_drain_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // pty_read_master(buf_ptr, cap) -> u64
+  //   Non-blocking sys_read(_pty_master_fd, buf_ptr, cap). Returns the
+  //   byte count (0 if the pty ring was empty, or if the sys_read call
+  //   itself failed -- e.g. no live master fd yet). See file header
+  //   "Attach seams" for the intended pty_feed_slave_bytes hand-off.
+  pub let pty_read_master : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf_ptr: u64) (cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "Wave iota pty_read_master. Two-push prologue (rbx=buf_ptr, r12=cap) plus `sub rsp,8` -- EVEN push count leaves the residue unchanged at rsp%16==8, so the extra 8-byte pad is required to reach rsp%16==0 at the nested sys_read call (mirrors kind_pty.pdx's own two-push-plus-pad accessors, e.g. pty_row_set_session_pid). rdi = _pty_master_fd (reloaded fresh, no callee-save needed for it since it is only read once). On a negative sys_read result (sign-bit test, `shr r10,63`), returns 0 rather than forwarding the errno -- this function's contract is 'byte count, 0 on nothing available', matching kind_pty.pdx's own PTY_RING_EMPTY-collapses-to-0-bytes posture at the sys_read layer. Labels prefixed pty_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                       // buf_ptr
+        mov r12, rsi;                       // cap
+
+        lea r11, [rip + _pty_master_fd];
+        mov rdi, [r11];
+        mov rsi, rbx;
+        mov rdx, r12;
+        call sys_read;
+
+        mov r10, rax;
+        shr r10, 63;
+        cmp r10, 0;
+        jne pty_read_master_fail;
+        jmp pty_read_master_out;
+
+      pty_read_master_fail:
+        xor rax, rax;
+
+      pty_read_master_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
         ret
       }
     }
 
   // pty_feed_slave_bytes(ptr, len) -> ()
-  //   Slave-fd attach seam: forwards (ptr, len) straight into
-  //   Ansi::ansi_feed_bytes (src/ansi.pdx, already landed and
-  //   exercised by three CLOSED-issue fingerprint tests), then bumps
-  //   _pty_slave_bytes_rendered by len. In a live kernel, `ptr` is a
-  //   buffer just filled by `sys_read(_pty_slave_fd, ptr, len)`; at
-  //   Wave OO any caller (a future scripted-HID smoke, or a live read
-  //   loop once R101 lands) can already exercise this exact call
-  //   shape against the real ANSI parser + grid.
+  //   Unchanged from Wave OO: forwards (ptr, len) straight into
+  //   Ansi::ansi_feed_bytes, then bumps _pty_slave_bytes_rendered.
   pub let pty_feed_slave_bytes : (u64, u64) -> () !{mem} @{} =
     fn (ptr: u64) (len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "pdxterm M3-001 (issue #6) pty_feed_slave_bytes. 1-push (rbx = len) preserves len across the nested ansi_feed_bytes call, since rsi is caller-save and ansi_feed_bytes is free to clobber it; rdi/rsi already hold (ptr, len) in the exact order ansi_feed_bytes expects, so no arg shuffle is needed before the call. Entry rsp%16 == 8 -> post-push rsp%16 == 0 for the nested call. All arithmetic is a single `add`, immediate-free. No `test`, no branch. No internal labels needed beyond the function name.",
+      justification: "pdxterm M3-001 (issue #6) pty_feed_slave_bytes, unchanged at Wave iota. 1-push (rbx = len) preserves len across the nested ansi_feed_bytes call, since rsi is caller-save and ansi_feed_bytes is free to clobber it; rdi/rsi already hold (ptr, len) in the exact order ansi_feed_bytes expects, so no arg shuffle is needed before the call. Entry rsp%16 == 8 -> post-push rsp%16 == 0 for the nested call. All arithmetic is a single `add`, immediate-free. No `test`, no branch. No internal labels needed beyond the function name.",
       block: {
         push rbx;                          // rsp%16: 8 -> 0
         mov rbx, rsi;                      // rbx = len (rdi = ptr already positioned)

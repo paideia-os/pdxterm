@@ -1,9 +1,18 @@
 # pdxterm STATUS
 
 Wave: R102 (userland graphical stack) + v1.1 satellite pass + Wave OO
-+ Wave BBB.
-Version: **v1.3.0** (Wave BBB landing 2026-09-13, pending build/debugger
++ Wave BBB + Wave iota.
+Version: **v1.4.0** (Wave iota landing 2026-09-14, pending build/debugger
 verification -- see note below).
+
+Wave iota closes the KIND_PTY kernel gap Wave BBB (#6) disclosed:
+paideia-os now ships a real `kind_pty.pdx` dispatch body + `sys_openpty`
+(SC+ 122, design/kernel/wave-iota-pty.md in the monorepo).
+`src/pty_wire.pdx` replaces its `sys_cap_invoke` stub with a real
+openpty + fork + dup2 + execve("/bin/sh") sequence; `src/pty_resize.pdx`
+(new) wires geometry changes to KIND_PTY's SET_DIMS op; `tests/
+pty_output_smoke.pdx` (new) forks+execve's "/bin/echo hello" through a
+real pty pair and asserts the bytes land in Scrollback's head slot.
 
 ## Issue-level status
 
@@ -24,7 +33,7 @@ build + smoke pass confirms the diff.
 | #3    | M2-001    | CODE LANDED (v1.2.0), pending verify | src/grid.pdx: `_cell_char`/`_cell_attr` + grid_put_char/grid_clear/grid_render_all via pdxterm_glyph_blit stub (libpdx-font not linkable yet) |
 | #4    | M2-002    | CODE LANDED (v1.2.0), pending verify | src/keyboard.pdx: 128-entry keysym LUT + `_pty_out_ring`; no live KIND_INPUT_EVENT subscription yet |
 | #5    | M2-003    | CODE LANDED (v1.2.0), pending verify | src/scrollback.pdx: 256x80 `_scrollback` ring + sb_push_row; not yet wired into Ansi's newline path |
-| #6    | M3-001    | CODE LANDED (v1.3.0), pending verify | src/pty_wire.pdx: sys_cap_invoke-based KIND_PTY spawn request + keyboard/master + slave/grid attach seams; honest kernel-gap disclosure (no kind_pty.pdx in the kernel tree yet) -- blocking on R101 §7.2.3 for a LIVE fd pair |
+| #6    | M3-001    | CODE LANDED (v1.4.0), pending verify | src/pty_wire.pdx: REAL KIND_PTY mint (sys_openpty, SC+ 122) + fork + dup2 + execve("/bin/sh") -- kernel gap closed by paideia-os Wave iota (kind_pty.pdx). Master fd kept for I/O (pty_read_master, pty_drain_keyboard_to_master); parent registers itself as session leader via OP_PTY_SET_SESSION_PID |
 | #7    | M3-002    | **LANDED (v1.1.0)** | src/ansi.pdx: CSI/SGR/cursor-move state machine + 9-case fingerprint matrix at tests/test_ansi.pdx |
 | #8    | M4-001    | **LANDED (v1.1.0)** | tests/render_identity.pdx: alphabet-repetition seed + FNV-1a-64 digest vs GOLDEN_RENDER_FP; BLAKE3 swap noted for M5 |
 | #9    | M4-002    | **LANDED (v1.1.0)** | tests/shell_echo_roundtrip.pdx: honest-blockage witness; substrate blocked on issues #3/#4/#6 + MON-005; fixture-fed half asserts h/e/l/l/o lands in row > 0 |
@@ -33,6 +42,8 @@ build + smoke pass confirms the diff.
 | #12   | M5-001    | CLOSED (retroactive, v1.3.0) | documentation-only close: manifest.pdxsig dual-sign note + README "Release status" section record that signing tooling is unbuilt org-wide; no fabricated signature |
 | #14   | v1.1-B    | **LANDED (v1.1.0)** | src/syscall.pdx + src/schema.pdx: sysno-115 wrapper + TermEventRecord@0.1 (48B) marshal + emit; 3-case composition fingerprint at tests/test_semantic_emit.pdx |
 | #15   | v1.1-C    | CLOSED (retroactive, v1.3.0) | documentation-only close: CHANGELOG.md v1.3.0 entry records the v1.1-C history alongside this wave's tag |
+| ι-04  | Wave iota | CODE LANDED (v1.4.0), pending verify | src/pty_resize.pdx: window-geometry-change -> KIND_PTY OP_PTY_SET_DIMS (TIOCSWINSZ analog); kernel side stores winsize + calls pty_winch_notify against the registered session leader pid (SIGWINCH-shaped, not a real signal -- see kind_pty.pdx's own disclosure) |
+| ι-05  | Wave iota | CODE LANDED (v1.4.0), pending verify | tests/pty_output_smoke.pdx: real openpty+fork+execve("/bin/echo hello") through a pty pair; asserts the 6-byte "hello\n" lands in both the receive buffer and Scrollback's head slot (0x1F full-pass fingerprint) |
 
 ## Downstream deps observed at Wave P
 
@@ -42,12 +53,12 @@ build + smoke pass confirms the diff.
 - **libpdx-argv 1.1.3+ UND-externs**: PDX_TOOL_NAME + PDX_TOOL_VERSION
   published preemptively per Wave F contract; live libpdx-argv link
   waits for the manifest deps bump at v1.2.
-- **KIND_PTY (§7.2.3, Wave BBB, issue #6)**: NOT kernel-landed. No
-  `kind_pty.pdx` dispatch body exists anywhere in the kernel tree;
-  `src/pty_wire.pdx`'s `pty_spawn_shell` dispatches through the
-  already-landed generic `sys_cap_invoke` (SC+ ID 4) and expects a
-  fail-closed negative-errno result until R101 lands real substrate.
-  See that file's header for the full disclosure.
+- **KIND_PTY (§7.2.3, Wave BBB #6 -> Wave iota)**: KERNEL-LANDED.
+  paideia-os `kind_pty.pdx` (KIND_PTY = 0x1E7) + `sys_openpty` (SC+ ID
+  122) mint a real 32-row pty pair; `src/pty_wire.pdx`'s
+  `pty_spawn_shell` now performs the real mint + fork + dup2 + execve
+  sequence. See design/kernel/wave-iota-pty.md in the monorepo and this
+  file's own header for the full contract.
 
 ## Encoder discipline (per user memory `pdx encoder pitfalls`)
 

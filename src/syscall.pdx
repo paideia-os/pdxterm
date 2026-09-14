@@ -1,5 +1,6 @@
-// src/syscall.pdx -- pdxterm Wave P (v1.1-B, issue #14)
-// Syscall module: sysno wrapper set pdxterm needs at Wave P.
+// src/syscall.pdx -- pdxterm Wave P (v1.1-B, issue #14) + Wave iota
+// (v1.4.0, real KIND_PTY body)
+// Syscall module: sysno wrapper set pdxterm needs at Wave P / iota.
 //
 // Scope
 // -----
@@ -8,6 +9,13 @@
 // 115 (`sys_semantic_send`). The M1/M2 substrate skeletons are pure
 // text-transducer state, so no earlier sysno is reachable from the
 // live code path at this milestone.
+//
+// Wave iota adds the five wrappers PtyWire::pty_spawn_shell needs now
+// that paideia-os lands a real KIND_PTY kernel body (kind_pty.pdx +
+// sys_openpty, SC+ ID 122): sys_openpty, sys_fork (56), sys_dup2 (32),
+// sys_execve (59), sys_exit (60). All five match the monorepo canonical
+// shim src/user/syscall_shim.pdx byte-for-byte (same SC+ IDs, same
+// effect/capability tails, same arg-passthrough shape).
 //
 // SC+ ID 115 provenance: R107-M0-001 (paideia-os #2350). The kernel
 // body copies `record_len` bytes from `record_ptr` into the next slot
@@ -32,6 +40,34 @@
 //   - Leaf function (no push/pop parity).
 
 module Syscall = structure {
+
+  // SC+ ID 0 -- sys_read(fd, buf, count) -> bytes read or -errno.
+  pub let SYS_READ : u64 = 0
+
+  pub let sys_read : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (buf: u64) (count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "Wave iota: SC+ ID 0 wrapper, matches src/user/syscall_shim.pdx sys_read byte-for-byte. Arity 3, no shuffle. Callers: PtyWire::pty_read_master (master-fd I/O) and PtyOutputSmoke's echo-readback loop.",
+      block: {
+        mov rax, 0;
+        syscall;
+        ret
+      }
+    }
+
+  // SC+ ID 1 -- sys_write(fd, buf, count) -> bytes written or -errno.
+  pub let SYS_WRITE : u64 = 1
+
+  pub let sys_write : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (buf: u64) (count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "Wave iota: SC+ ID 1 wrapper, matches src/user/syscall_shim.pdx sys_write byte-for-byte. Arity 3, no shuffle. Sole pdxterm caller: PtyWire::pty_drain_keyboard_to_master (real master-fd write, replacing the Wave OO byte-count staging stub).",
+      block: {
+        mov rax, 1;
+        syscall;
+        ret
+      }
+    }
 
   // SC+ ID 4 -- sys_cap_invoke(slot, op_arg) -> result. Generic cap
   // operation dispatch, R13 legacy still frozen in the dispatcher; see
@@ -69,6 +105,97 @@ module Syscall = structure {
       justification: "pdxterm v1.1-B (issue #14): SC+ ID 115 wrapper. Arity 3 -- SysV rdi/rsi/rdx pass through unchanged to SYSCALL rdi/rsi/rdx (no arg3 shuffle). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_semantic_send.pdx (landed R107-M0-001 #2350). Effect/capability tail matches the monorepo canonical shim src/user/syscall_shim.pdx sys_semantic_send byte-for-byte: !{mem, sysreg} for SYSCALL + the kernel-side record-body copy into _semantic_ring; capabilities:{} because the sysno operates over a fixed global ring with no per-caller cap check. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Sole pdxterm caller at Wave P: Schema::term_event_emit (src/schema.pdx). Labels: none (linear body).",
       block: {
         mov rax, 115;
+        syscall;
+        ret
+      }
+    }
+
+  // SC+ ID 122 -- see paideia-os design/user/syscall-table.md +
+  // design/kernel/wave-iota-pty.md. Kernel body:
+  // src/kernel/core/syscall/handlers/sys_openpty.pdx.
+  pub let SYS_OPENPTY : u64 = 122
+
+  // sys_openpty(rows, cols) -> master_fd | (slave_fd << 8) | (cap_slot << 16)
+  //   or a negative errno. SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle).
+  pub let sys_openpty : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "Wave iota (paideia-os pdxterm real-body wave): SC+ ID 122 wrapper. Arity 2 -- SysV rdi/rsi pass through unchanged to SYSCALL rdi/rsi (no shuffle). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_openpty.pdx. Effect/capability tail !{mem,sysreg} @{cap} matches the kernel body's own declaration (mem for the fd_table/cap_table/row writes, cap because pty_cap_mint mints a capability). Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Sole pdxterm caller: PtyWire::pty_spawn_shell (src/pty_wire.pdx). Labels: none (linear body).",
+      block: {
+        mov rax, 122;
+        syscall;
+        ret
+      }
+    }
+
+  // SC+ ID 32 -- sys_dup2(oldfd, newfd) -> newfd or -errno.
+  pub let SYS_DUP2 : u64 = 32
+
+  pub let sys_dup2 : (u64, u64) -> u64 !{sysreg} @{fs} =
+    fn (oldfd: u64) (newfd: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {fs},
+      justification: "Wave iota: SC+ ID 32 wrapper, matches src/user/syscall_shim.pdx sys_dup2 byte-for-byte. Arity 2, no shuffle. Sole pdxterm caller: PtyWire::pty_spawn_shell (child branch, dup2(slave_fd, 0/1/2)).",
+      block: {
+        mov rax, 32;
+        syscall;
+        ret
+      }
+    }
+
+  // SC+ ID 56 -- sys_fork() -> pid (0 in child, child_pid in parent,
+  // or -errno).
+  pub let SYS_FORK : u64 = 56
+
+  pub let sys_fork : () -> u64 !{mem, sysreg} @{sched, mem} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem},
+      justification: "Wave iota: SC+ ID 56 wrapper, matches src/user/syscall_shim.pdx sys_fork byte-for-byte. Arity 0. Sole pdxterm caller: PtyWire::pty_spawn_shell.",
+      block: {
+        mov rax, 56;
+        syscall;
+        ret
+      }
+    }
+
+  // SC+ ID 59 -- sys_execve(path, argv, envp) -> never returns on
+  // success, or -errno.
+  pub let SYS_EXECVE : u64 = 59
+
+  pub let sys_execve : (u64, u64, u64) -> u64 !{mem, sysreg} @{sched, mem} =
+    fn (path: u64) (argv: u64) (envp: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem},
+      justification: "Wave iota: SC+ ID 59 wrapper, matches src/user/syscall_shim.pdx sys_execve byte-for-byte. Arity 3, no shuffle. Sole pdxterm caller: PtyWire::pty_spawn_shell (child branch, execve('/bin/sh', argv, envp=0)).",
+      block: {
+        mov rax, 59;
+        syscall;
+        ret
+      }
+    }
+
+  // SC+ ID 116 -- sys_sched_wait_ns(ns) -> always 0. Kernel body:
+  // paideia-os src/kernel/core/syscall/handlers/sys_sched_wait_ns.pdx.
+  pub let SYS_SCHED_WAIT_NS : u64 = 116
+
+  pub let sys_sched_wait_ns : (u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (ns: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "Wave iota: SC+ ID 116 wrapper. Arity 1, no shuffle. Sole pdxterm caller: tests/pty_output_smoke.pdx's poll loop, yielding between sys_read retries while the forked /bin/echo child is scheduled.",
+      block: {
+        mov rax, 116;
+        syscall;
+        ret
+      }
+    }
+
+  // SC+ ID 60 -- sys_exit(status) -> never returns.
+  pub let SYS_EXIT : u64 = 60
+
+  pub let sys_exit : (u64) -> u64 !{sysreg} @{sched} =
+    fn (status: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {sched},
+      justification: "Wave iota: SC+ ID 60 wrapper, matches src/user/syscall_shim.pdx sys_exit byte-for-byte. Arity 1, no shuffle. Sole pdxterm caller: PtyWire::pty_spawn_shell (child branch, exit(1) if execve returns -- i.e. failed).",
+      block: {
+        mov rax, 60;
         syscall;
         ret
       }

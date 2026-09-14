@@ -25,9 +25,17 @@
 # #11: 300-row push smoke against Scrollback's 256-slot ring). Issues
 # #12 (M5-001 signed 1.0.0 release) and #15 (v1.1-C release closer)
 # are retroactive documentation closes -- see CHANGELOG.md.
+#
+# Wave iota (v1.4.0, paideia-os pdxterm real-body wave) closes the
+# KIND_PTY kernel gap Wave BBB disclosed: src/pty_wire.pdx now performs
+# a real sys_openpty (SC+ 122) + sys_fork + sys_dup2 + sys_execve("/bin/
+# sh") sequence instead of the sys_cap_invoke stub; src/pty_resize.pdx
+# (new) wires window-geometry changes to KIND_PTY's SET_DIMS op; tests/
+# pty_output_smoke.pdx (new) forks+execve's "/bin/echo hello" through a
+# real pty pair and asserts the bytes land in Scrollback's head slot.
 
 name        = pdxterm
-version     = 1.3.0
+version     = 1.4.0
 kind        = tool
 entry       = Main::pdxterm_main
 output      = build-out/pdxterm
@@ -35,12 +43,13 @@ caps_decl   = caps.decl
 
 sources:
   - src/tool_ident.pdx           # Wave F: PDX_TOOL_NAME/PDX_TOOL_VERSION externs
-  - src/syscall.pdx              # sys_semantic_send (SC+ ID 115) + sys_cap_invoke (SC+ ID 4, #6) wrappers
+  - src/syscall.pdx              # sysno wrapper set (0/1/4/32/56/59/60/115/116/122)
   - src/grid.pdx                 # 80x25 cursor grid (M3 skeleton) + M2-001 (#3) put_char/clear/render_all cell planes
   - src/window.pdx               # M1-002 (#2): argv rows/cols + KIND_SURFACE request stub
   - src/keyboard.pdx             # M2-002 (#4): keysym->byte LUT + stub-pty ring
   - src/scrollback.pdx           # M2-003 (#5): 256-row scrollback ring
-  - src/pty_wire.pdx             # M3-001 (#6): KIND_PTY spawn request + master/slave attach seams
+  - src/pty_wire.pdx             # M3-001 (#6) + Wave iota: real KIND_PTY mint + fork + execve("/bin/sh")
+  - src/pty_resize.pdx           # Wave iota (ι-04): window-geometry -> KIND_PTY SET_DIMS
   - src/ansi.pdx                 # M3-002 (#7): ANSI CSI/SGR/cursor-move state machine
   - src/schema.pdx               # v1.1-B (#14): TermEventRecord@0.1 emit
   - src/main.pdx                 # pdxterm_main entry
@@ -54,6 +63,7 @@ tests:
   - tests/shell_echo_roundtrip.pdx         # M4-002 (#9): honest-blockage witness
   - tests/scrollback_smoke.pdx             # M4-004 (#11): 300-row push vs 256-slot ring fingerprint
   - tests/test_semantic_emit.pdx           # v1.1-B (#14): sysno-115 marshal fingerprint
+  - tests/pty_output_smoke.pdx             # Wave iota (ι-05): real pty echo-hello scrollback fingerprint
 
 compliance:
   - module-basename-pascal

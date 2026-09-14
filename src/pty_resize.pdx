@@ -1,0 +1,93 @@
+// src/pty_resize.pdx -- pdxterm Wave iota (v1.4.0, ι-04)
+// PtyResize module: window-geometry-change -> KIND_PTY SET_DIMS
+// (TIOCSWINSZ analog).
+//
+// Scope
+// -----
+// pdxterm has no live window-manager resize event source yet (src/
+// window.pdx's own argv-driven `--rows=`/`--cols=` sizing is parsed
+// once at startup; a real KIND_SURFACE geometry-change notification is
+// blocked on the same libpdx-gfx dependency window.pdx's header already
+// names). This file provides the STABLE PRIMITIVE a future resize-event
+// handler calls: `pty_resize_notify(rows, cols)` packs the new
+// dimensions into cap_handler_pty.pdx's `OP_PTY_SET_DIMS` payload shape
+// and dispatches `sys_cap_invoke(pty_cap_slot, op_arg)` against the pty
+// cap `PtyWire::pty_spawn_shell` minted (`PtyWire::_pty_cap_slot`).
+//
+// Kernel-side effect (kind_pty.pdx cap_handler_pty.pdx OP_PTY_SET_DIMS,
+// paideia-os): stores the new `winsize` word on the pty row, then reads
+// the row's `session_leader_pid` (registered by `pty_spawn_shell`'s
+// parent branch right after `fork()`) and calls `pty_winch_notify`
+// against it -- a SIGWINCH-SHAPED notification, not a real POSIX
+// signal: this kernel has no generic per-task pending-signal mask yet
+// (see kind_pty.pdx's own file header "SIGWINCH-SHAPED NOTIFICATION").
+// `pty_winch_notify` bumps a per-pid pending-resize counter a future
+// real signal-dispatch loop consumes; it is a documented, honest
+// substrate landing, not a live SIGWINCH delivery.
+//
+// Payload packing (cap_handler_pty.pdx OP_PTY_SET_DIMS contract):
+//   op_arg = 1 | (payload << 8)
+//   payload = cols[15:0] | (rows[15:0] << 16)
+// (the outer `op | payload<<8` shape is invoke.pdx's `call_kind_pty`
+// generic unpack, identical to every other KIND_PTY op; the inner
+// `cols | rows<<16` shape is SET_DIMS's own payload contract).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module PtyResize (PascalCase basename).
+//   - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+//   - No 2-op `imul` (no multiplication needed in this file).
+//   - No `and r8..r15, imm64`; the widest mask (0xFFFF) fits imm32.
+//   - r11 scratch for every rip-relative lea.
+//   - Labels prefixed `ptyr_`.
+
+module PtyResize = structure {
+
+  pub let OP_PTY_SET_DIMS : u64 = 1
+
+  // pty_resize_notify(rows, cols) -> u64
+  //   Packs (rows, cols) into cap_handler_pty.pdx's SET_DIMS payload
+  //   shape and dispatches sys_cap_invoke against PtyWire's live pty
+  //   cap slot. Returns sys_cap_invoke's raw result (0 == PTY_OK on
+  //   success; a negative errno, or INVOKE_DENIED / PTY_BAD_DIMS /
+  //   PTY_UNSUP_OP, forwarded verbatim for the caller to log). Rows and
+  //   cols above 65535 are silently truncated to their low 16 bits by
+  //   the packing itself -- kind_pty.pdx's own pty_rows_valid/pty_cols_
+  //   valid additionally refuse anything above 4096, well inside that
+  //   range, so no real geometry ever hits the truncation boundary.
+  pub let pty_resize_notify : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "Wave iota (ι-04) pty_resize_notify. Two-push prologue (rbx=rows, r12=cols) plus `sub rsp,8` -- even push count, entry rsp%16==8 stays at 8, the pad reaches 0 for the nested sys_cap_invoke call. Payload = cols & 0xFFFF | ((rows & 0xFFFF) << 16); op_arg = OP_PTY_SET_DIMS(1) | (payload << 8) -- matches cap_handler_pty.pdx's OP_PTY_SET_DIMS decode (`shr r11,32;cmp r11,0` reserved-bits gate on that side sees zero since payload here is built to fit exactly 32 bits, well under the 56-bit field cap_invoke's generic unpack carries). rdi = PtyWire::_pty_cap_slot (reloaded fresh; a resize call this early in the tree's event-loop maturity is not yet hot enough to warrant caching it in a register across an unrelated call boundary). Labels prefixed ptyr_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // rows
+        mov r12, rsi;                        // cols
+
+        mov rax, r12;
+        and rax, 0xFFFF;                     // cols low 16
+        mov r10, rbx;
+        and r10, 0xFFFF;                     // rows low 16
+        shl r10, 16;
+        or  rax, r10;                        // payload = cols | (rows << 16)
+
+        shl rax, 8;
+        mov r10, 1;                          // OP_PTY_SET_DIMS
+        or  rax, r10;                        // op_arg = op | (payload << 8)
+
+        lea r11, [rip + _pty_cap_slot];
+        mov rdi, [r11];                      // pty_cap_slot
+        mov rsi, rax;                        // op_arg
+        call sys_cap_invoke;
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}
